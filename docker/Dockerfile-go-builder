@@ -1,0 +1,6 @@
+FROM golang:1.19-alpine3.16 
+ARG version 
+RUN apk add build-base
+WORKDIR /app
+COPY go.* ./ 
+RUN go mod download

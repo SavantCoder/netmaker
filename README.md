@@ -1,75 +1,79 @@
 
 <p align="center">
-  <img src="netmaker.png" width="75%"><break/>
+  <a href="https://netmaker.io">
+  <img src="https://raw.githubusercontent.com/gravitl/netmaker-docs/master/images/netmaker-github/netmaker-teal.png" width="50%"><break/>
+  </a>
 </p>
+
 <p align="center">
-<i>Create and control automated virtual networks.</i> 
+<a href="https://runacap.com/ross-index/q1-2022/" target="_blank" rel="noopener">
+    <img src="https://runacap.com/wp-content/uploads/2022/06/ROSS_badge_white_Q1_2022.svg" alt="ROSS Index - Fastest Growing Open-Source Startups in Q1 2022 | Runa Capital"  width="15%"/>
+</a>  
+<a href="https://www.ycombinator.com/companies/netmaker/" target="_blank" rel="noopener">
+    <img src="https://raw.githubusercontent.com/gravitl/netmaker-docs/master/images/netmaker-github/y-combinator.png" alt="Y-Combinator" width="16%" />
+</a>  
+
 </p>
 
 <p align="center">
   <a href="https://github.com/gravitl/netmaker/releases">
-    <img src="https://img.shields.io/badge/Version-0.9.1-informational?style=flat-square" />
+    <img src="https://img.shields.io/badge/Version-0.17.1-informational?style=flat-square" />
   </a>
   <a href="https://hub.docker.com/r/gravitl/netmaker/tags">
-    <img src="https://img.shields.io/docker/pulls/gravitl/netmaker" />
+    <img src="https://img.shields.io/docker/pulls/gravitl/netmaker?label=downloads" />
   </a>  
   <a href="https://goreportcard.com/report/github.com/gravitl/netmaker">
     <img src="https://goreportcard.com/badge/github.com/gravitl/netmaker" />
   </a>
-  <a href="https://github.com/gravitl/netmaker/graphs/contributors">
-    <img src="https://img.shields.io/github/commit-activity/m/gravitl/netmaker?color=blue" />
-  </a>
-  <a href="https://twitter.com/intent/follow?screen_name=gravitlcorp">
-    <img src="https://img.shields.io/twitter/follow/gravitlcorp?style=social" />
+  <a href="https://twitter.com/intent/follow?screen_name=netmaker_io">
+    <img src="https://img.shields.io/twitter/follow/netmaker_io?label=follow&style=social" />
   </a>
   <a href="https://www.youtube.com/channel/UCach3lJY_xBV7rGrbUSvkZQ">
     <img src="https://img.shields.io/youtube/channel/views/UCach3lJY_xBV7rGrbUSvkZQ?style=social" />
   </a>
+  <a href="https://reddit.com/r/netmaker">
+    <img src="https://img.shields.io/reddit/subreddit-subscribers/netmaker?label=%2Fr%2Fnetmaker&style=social" />
+  </a>  
+  <a href="https://discord.gg/zRb9Vfhk8A">
+    <img src="https://img.shields.io/discord/825071750290210916?color=%09%237289da&label=chat" />
+  </a> 
 </p>
 
-# WireGuard® Automation from Homelab to Enterprise
-- [x] Peer-to-Peer Mesh Networks
-- [x] Kubernetes and Multi-Cloud Enablement
-- [x] Remote Site Access via Gateway
-- [x] OAuth and Private DNS Features
-- [x] Support for Linux, Mac, Windows, FreeBSD, iPhone, and Android
+# WireGuard<sup>®</sup> automation from homelab to enterprise
+
+| Create                                    | Manage                                  | Automate                                |
+|-------------------------------------------|-----------------------------------------|-----------------------------------------|
+| :heavy_check_mark: WireGuard Networks     | :heavy_check_mark: Admin UI             | :heavy_check_mark: Linux                |
+| :heavy_check_mark: Remote Access Gateways | :heavy_check_mark: OAuth                | :heavy_check_mark: FreeBSD              |
+| :heavy_check_mark: Mesh VPNs              | :heavy_check_mark: Private DNS          | :heavy_check_mark: Mac                  |
+| :heavy_check_mark: Site-to-Site           | :heavy_check_mark: Access Control Lists | :heavy_check_mark: Windows              |
 
 # Get Started in 5 Minutes  
 
-**For DigitalOcean, use the 1-Click App:** <a href="https://marketplace.digitalocean.com/apps/netmaker?refcode=496ffcf1e252"><img src="https://www.deploytodo.com/do-btn-blue.svg" width="15%" /></a>  
-**For production-grade installations, visit the [Install Docs](https://netmaker.readthedocs.io/en/master/install.html).**  
-**For an HA install using helm on k8s, visit the [Helm Repo](https://github.com/gravitl/netmaker-helm/).**
-1. Get a cloud VM with Ubuntu 20.04 and a public IP.
-2. Open ports 443, 80, 53, and 51821-51830/udp on the VM firewall and in cloud security settings.
-3. Run the script **(see below for optional configurations)**:
+(For production-grade installations, visit the [Install Docs](https://netmaker.readthedocs.io/en/master/install.html).)  
 
-`sudo wget -qO - https://raw.githubusercontent.com/gravitl/netmaker/master/scripts/nm-quick.sh | bash`
+1. Get a cloud VM with Ubuntu 22.04 and a public IP.
+2. Open ports 443, 80, and 51821-51830/udp on the VM firewall and in cloud security settings.
+3. (optional) Prepare DNS - Set a wildcard subdomain in your DNS for Netmaker, e.g. *.netmaker.example.com
+4. Run the script: 
 
-<img src="./docs/images/install-server.gif" width="50%" /><img src="./docs/images/visit-website.gif" width="50%" />
+`sudo wget -qO /root/nm-quick-interactive.sh https://raw.githubusercontent.com/gravitl/netmaker/master/scripts/nm-quick-interactive.sh && sudo chmod +x /root/nm-quick-interactive.sh && sudo /root/nm-quick-interactive.sh`  
 
-Upon completion, the logs will display the instructions to connect various devices. These can also be retrived from the UI under "Access Keys."
+This script gives you the option to deploy the Community or Enterprise version of Netmaker. If deploying Enterprise, you get a free account with a 50 node limit by default. It also gives you the option to use your own domain (recommended) or an auto-generated domain. 
 
-After installing Netmaker, check out the [Walkthrough](https://itnext.io/getting-started-with-netmaker-a-wireguard-virtual-networking-platform-3d563fbd87f0) and [Getting Started](https://netmaker.readthedocs.io/en/master/getting-started.html) guides to learn more about configuring networks. Or, check out some of our other [Tutorials](https://gravitl.com/resources) for different use cases, including Kubernetes.
+<p float="left" align="middle">
+<img src="https://raw.githubusercontent.com/gravitl/netmaker-docs/master/images/netmaker-github/readme.gif" />
+</p>
 
-### Optional configurations
+After installing Netmaker, check out the [Walkthrough](https://itnext.io/getting-started-with-netmaker-a-wireguard-virtual-networking-platform-3d563fbd87f0) and [Getting Started](https://netmaker.readthedocs.io/en/master/getting-started.html) guides to learn more about configuring networks. Or, check out some of our other [Tutorials](https://www.netmaker.io/blog) for different use cases, including Kubernetes.
 
-**Deploy a "Hub-And-Spoke VPN" on the server**  
-*This will configure a standard VPN (non-meshed) for private internet access, with 10 clients (-c).*  
-`sudo wget -qO - https://raw.githubusercontent.com/gravitl/netmaker/master/scripts/nm-quick.sh | bash -s -- -v true -c 10`  
+# Get Support
 
-**Specify Domain and Email**  
-*Make sure your wildcard domain is pointing towards the server ip.*  
-`sudo wget -qO - https://raw.githubusercontent.com/gravitl/netmaker/master/scripts/nm-quick.sh | bash -s -- -d mynetmaker.domain.com -e example@email.com`  
+- [Discord](https://discord.gg/zRb9Vfhk8A)
 
-**Script Options**  
-```
-./nm-quick
--d domain.example.com # specify a wildcard domain for netmaker to use (DNS must point to this server)
--e myemail@example.com # specify your email (for SSL certificates)
--m true # create a default 'mesh network' (on by default)
--v false # create a default 'VPN network' (off by default)
--c 7 # number of client configs to create (for VPN network, 5 by default)
-```
+- [Reddit](https://reddit.com/r/netmaker)
+
+- [Learning Resources](https://netmaker.io/blog)
 
 # Why Netmaker + WireGuard?
 
@@ -80,14 +84,6 @@ After installing Netmaker, check out the [Walkthrough](https://itnext.io/getting
 - Netmaker is built to scale from the small business to the enterprise. 
 
 - Netmaker with WireGuard can be highly customized for peer-to-peer, site-to-site, Kubernetes, and more.
-
-# Get Support
-
-- [Community (Discord)](https://discord.gg/zRb9Vfhk8A)
-
-- [Business (Subscription)](https://gravitl.com/plans/business)
-
-- [Learning Resources](https://gravitl.com/resources)
 
 # Community Projects
 
@@ -103,6 +99,11 @@ After installing Netmaker, check out the [Walkthrough](https://itnext.io/getting
 
 - [Terraform Provider](https://github.com/madacluster/netmaker-terraform-provider)
 
+- [VyOS Integration](https://github.com/kylechase/vyos-netmaker)
+
+- [Netmaker K3S](https://github.com/geragcp/netmaker-k3s)
+
+- [Run Netmaker + Netclient with Podman](https://github.com/agorgl/nm-setup)
 
 ## Disclaimer
  [WireGuard](https://wireguard.com/) is a registered trademark of Jason A. Donenfeld.

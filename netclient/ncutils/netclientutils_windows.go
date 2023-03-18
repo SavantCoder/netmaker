@@ -1,16 +1,18 @@
 package ncutils
 
 import (
+	"embed"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"syscall"
 
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+	"github.com/gravitl/netmaker/logger"
 )
+
+//go:embed windowsdaemon/winsw.exe
+var winswContent embed.FS
 
 // RunCmd - runs a local command
 func RunCmd(command string, printerr bool) (string, error) {
@@ -20,8 +22,8 @@ func RunCmd(command string, printerr bool) (string, error) {
 	//cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: "/C \"" + command + "\""}
 	out, err := cmd.CombinedOutput()
 	if err != nil && printerr {
-		log.Println("error running command:", command)
-		log.Println(strings.TrimSuffix(string(out), "\n"))
+		logger.Log(0, "error running command:", command)
+		logger.Log(0, strings.TrimSuffix(string(out), "\n"))
 	}
 	return string(out), err
 }
@@ -37,38 +39,23 @@ func RunCmdFormatted(command string, printerr bool) (string, error) {
 	cmd.Wait()
 	out, err := cmd.CombinedOutput()
 	if err != nil && printerr {
-		log.Println("error running command:", command)
-		log.Println(strings.TrimSuffix(string(out), "\n"))
+		logger.Log(0, "error running command:", command)
+		logger.Log(0, strings.TrimSuffix(string(out), "\n"))
 	}
 	return string(out), err
 }
 
-// CreateUserSpaceConf - creates a user space WireGuard conf
-func CreateUserSpaceConf(address string, privatekey string, listenPort string, mtu int32, perskeepalive int32, peers []wgtypes.PeerConfig) (string, error) {
-	peersString, err := parsePeers(perskeepalive, peers)
-	var listenPortString string
-	if mtu <= 0 {
-		mtu = 1280
-	}
-	if listenPort != "" {
-		listenPortString += "ListenPort = " + listenPort
-	}
+// GetEmbedded - Gets the Windows daemon creator
+func GetEmbedded() error {
+	data, err := winswContent.ReadFile("windowsdaemon/winsw.exe")
 	if err != nil {
-		return "", err
+		return err
 	}
-	config := fmt.Sprintf(`[Interface]
-Address = %s
-PrivateKey = %s
-MTU = %s
-%s
-
-%s
-
-`,
-		address+"/32",
-		privatekey,
-		strconv.Itoa(int(mtu)),
-		listenPortString,
-		peersString)
-	return config, nil
+	fileName := fmt.Sprintf("%swinsw.exe", GetNetclientPathSpecific())
+	err = os.WriteFile(fileName, data, 0700)
+	if err != nil {
+		logger.Log(0, "could not mount winsw.exe")
+		return err
+	}
+	return nil
 }

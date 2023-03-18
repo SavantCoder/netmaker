@@ -1,7 +1,7 @@
 package local
 
 import (
-	//"github.com/davecgh/go-spew/spew"
+	// "github.com/davecgh/go-spew/spew"
 	"errors"
 	"log"
 	"net"
@@ -15,9 +15,9 @@ import (
 
 // SetIPForwarding - Sets IP forwarding if it's mac or linux
 func SetIPForwarding() error {
-	os := runtime.GOOS
+	runtimeOS := runtime.GOOS
 	var err error
-	switch os {
+	switch runtimeOS {
 	case "linux":
 		err = SetIPForwardingUnix()
 	case "freebsd":
@@ -25,13 +25,15 @@ func SetIPForwarding() error {
 	case "darwin":
 		err = SetIPForwardingMac()
 	default:
-		err = errors.New("This OS is not supported")
+		err = errors.New("this OS is not currently supported")
 	}
 	return err
 }
 
 // SetIPForwardingLinux - sets the ipforwarding for linux
 func SetIPForwardingUnix() error {
+
+	// ipv4
 	out, err := ncutils.RunCmd("sysctl net.ipv4.ip_forward", true)
 	if err != nil {
 		log.Println("WARNING: Error encountered setting ip forwarding. This can break functionality.")
@@ -46,6 +48,23 @@ func SetIPForwardingUnix() error {
 			}
 		}
 	}
+
+	// ipv6
+	out, err = ncutils.RunCmd("sysctl net.ipv6.conf.all.forwarding", true)
+	if err != nil {
+		log.Println("WARNING: Error encountered setting ipv6 forwarding. This can break functionality.")
+		return err
+	} else {
+		s := strings.Fields(string(out))
+		if s[2] != "1" {
+			_, err = ncutils.RunCmd("sysctl -w  net.ipv6.conf.all.forwarding=1", true)
+			if err != nil {
+				log.Println("WARNING: Error encountered setting ipv6 forwarding. You may want to investigate this.")
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 

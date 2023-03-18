@@ -1,44 +1,91 @@
 package logic
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
-	"time"
 
+	"github.com/gravitl/netmaker/database"
+	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/models"
 	"github.com/gravitl/netmaker/netclient/ncutils"
+	"github.com/gravitl/netmaker/netclient/wireguard"
 	"github.com/gravitl/netmaker/servercfg"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
+
+// EnterpriseCheckFuncs - can be set to run functions for EE
+var EnterpriseCheckFuncs []func()
+
+// EnterpriseFailoverFunc - interface to control failover funcs
+var EnterpriseFailoverFunc func(node *models.Node) error
+
+// EnterpriseResetFailoverFunc - interface to control reset failover funcs
+var EnterpriseResetFailoverFunc func(network string) error
+
+// EnterpriseResetAllPeersFailovers - resets all nodes that are considering a node to be failover worthy (inclusive)
+var EnterpriseResetAllPeersFailovers func(nodeid, network string) error
 
 // == Join, Checkin, and Leave for Server ==
 
 // KUBERNETES_LISTEN_PORT - starting port for Kubernetes in order to use NodePort range
 const KUBERNETES_LISTEN_PORT = 31821
+
+// KUBERNETES_SERVER_MTU - ideal mtu for kubernetes deployments right now
 const KUBERNETES_SERVER_MTU = 1024
 
 // ServerJoin - responsible for joining a server to a network
-func ServerJoin(network string, serverID string, privateKey string) error {
-
-	if network == "" {
-		return errors.New("no network provided")
+func ServerJoin(networkSettings *models.Network) (models.Node, error) {
+	var returnNode models.Node
+	if networkSettings == nil || networkSettings.NetID == "" {
+		return returnNode, errors.New("no network provided")
 	}
 
 	var err error
-	var node *models.Node // fill this object with server node specifics
-	node = &models.Node{
-		IsServer:     "yes",
-		DNSOn:        "no",
-		IsStatic:     "yes",
-		Name:         models.NODE_SERVER_NAME,
-		MacAddress:   serverID,
-		UDPHolePunch: "no",
+
+	var currentServers = GetServerNodes(networkSettings.NetID)
+	var serverCount = 1
+	if currentServers != nil {
+		serverCount = len(currentServers) + 1
 	}
+	var ishub = "no"
+
+	if networkSettings.IsPointToSite == "yes" {
+		nodes, err := GetNetworkNodes(networkSettings.NetID)
+		if err != nil || nodes == nil {
+			ishub = "yes"
+		} else {
+			sethub := true
+			for i := range nodes {
+				if nodes[i].IsHub == "yes" {
+					sethub = false
+				}
+			}
+			if sethub {
+				ishub = "yes"
+			}
+		}
+	}
+	var node = &models.Node{
+		IsServer:        "yes",
+		DNSOn:           "no",
+		IsStatic:        "yes",
+		Name:            fmt.Sprintf("%s-%d", models.NODE_SERVER_NAME, serverCount),
+		MacAddress:      servercfg.GetNodeID(),
+		ID:              "", // will be set to new uuid
+		UDPHolePunch:    "no",
+		IsLocal:         networkSettings.IsLocal,
+		LocalRange:      networkSettings.LocalRange,
+		OS:              runtime.GOOS,
+		Version:         servercfg.Version,
+		IsHub:           ishub,
+		NetworkSettings: *networkSettings,
+	}
+
 	SetNodeDefaults(node)
 
 	if servercfg.GetPlatform() == "Kubernetes" {
@@ -47,395 +94,119 @@ func ServerJoin(network string, serverID string, privateKey string) error {
 	}
 
 	if node.LocalRange != "" && node.LocalAddress == "" {
-		Log("local vpn, getting local address from range: "+node.LocalRange, 1)
-		node.LocalAddress = GetLocalIP(*node)
+		logger.Log(1, "local vpn, getting local address from range:", networkSettings.LocalRange)
+		node.LocalAddress, err = getServerLocalIP(networkSettings)
+		if err != nil {
+			node.LocalAddress = ""
+			node.IsLocal = "no"
+		}
 	}
 
 	if node.Endpoint == "" {
 		if node.IsLocal == "yes" && node.LocalAddress != "" {
 			node.Endpoint = node.LocalAddress
 		} else {
-			node.Endpoint, err = ncutils.GetPublicIP()
+			node.Endpoint, err = servercfg.GetPublicIP()
 		}
 		if err != nil || node.Endpoint == "" {
-			Log("Error setting server node Endpoint.", 0)
-			return err
+			logger.Log(0, "Error setting server node Endpoint.")
+			return returnNode, err
 		}
 	}
+
+	var privateKey = ""
 
 	// Generate and set public/private WireGuard Keys
 	if privateKey == "" {
 		wgPrivatekey, err := wgtypes.GeneratePrivateKey()
 		if err != nil {
-			Log(err.Error(), 1)
-			return err
+			logger.Log(1, err.Error())
+			return returnNode, err
 		}
 		privateKey = wgPrivatekey.String()
 		node.PublicKey = wgPrivatekey.PublicKey().String()
 	}
-	// should never set mac address for server anymore
 
-	var postnode *models.Node
-	postnode = &models.Node{
-		Password:            node.Password,
-		MacAddress:          node.MacAddress,
-		AccessKey:           node.AccessKey,
-		Network:             network,
-		ListenPort:          node.ListenPort,
-		PostUp:              node.PostUp,
-		PostDown:            node.PostDown,
-		PersistentKeepalive: node.PersistentKeepalive,
-		LocalAddress:        node.LocalAddress,
-		Interface:           node.Interface,
-		PublicKey:           node.PublicKey,
-		DNSOn:               node.DNSOn,
-		Name:                node.Name,
-		Endpoint:            node.Endpoint,
-		SaveConfig:          node.SaveConfig,
-		UDPHolePunch:        node.UDPHolePunch,
-	}
+	node.Network = networkSettings.NetID
 
-	Log("adding a server instance on network "+postnode.Network, 2)
-	*node, err = CreateNode(*postnode, network)
+	logger.Log(2, "adding a server instance on network", node.Network)
 	if err != nil {
-		return err
+		return returnNode, err
 	}
 	err = SetNetworkNodesLastModified(node.Network)
 	if err != nil {
-		return err
+		return returnNode, err
 	}
 
 	// get free port based on returned default listen port
 	node.ListenPort, err = ncutils.GetFreePort(node.ListenPort)
 	if err != nil {
-		Log("Error retrieving port: "+err.Error(), 2)
+		logger.Log(2, "Error retrieving port:", err.Error())
 	} else {
-		Log("Set client port to "+fmt.Sprintf("%d", node.ListenPort)+" for network "+node.Network, 1)
+		logger.Log(1, "Set client port to", fmt.Sprintf("%d", node.ListenPort), "for network", node.Network)
 	}
 
 	// safety check. If returned node from server is local, but not currently configured as local, set to local addr
 	if node.IsLocal == "yes" && node.LocalRange != "" {
 		node.LocalAddress, err = ncutils.GetLocalIP(node.LocalRange)
 		if err != nil {
-			return err
+			return returnNode, err
 		}
 		node.Endpoint = node.LocalAddress
 	}
 
-	node.SetID()
+	if err = CreateNode(node); err != nil {
+		return returnNode, err
+	}
 	if err = StorePrivKey(node.ID, privateKey); err != nil {
-		return err
-	}
-	if err = ServerPush(node); err != nil {
-		return err
+		return returnNode, err
 	}
 
-	peers, hasGateway, gateways, err := GetServerPeers(node.MacAddress, network, node.IsDualStack == "yes", node.IsIngressGateway == "yes")
+	peers, err := GetPeerUpdate(node)
 	if err != nil && !ncutils.IsEmptyRecord(err) {
-		Log("failed to retrieve peers", 1)
-		return err
+		logger.Log(1, "failed to retrieve peers")
+		return returnNode, err
 	}
 
-	err = initWireguard(node, privateKey, peers, hasGateway, gateways)
+	err = wireguard.InitWireguard(node, privateKey, peers.Peers)
 	if err != nil {
-		return err
+		return returnNode, err
 	}
 
-	return nil
+	return *node, nil
 }
 
-// ServerCheckin - runs pulls and pushes for server
-func ServerCheckin(mac string, network string) error {
-	var serverNode models.Node
-	var newNode *models.Node
-	var err error
-	serverNode, err = GetNode(mac, network)
-	if err != nil {
-		return err
+// EnterpriseCheck - Runs enterprise functions if presented
+func EnterpriseCheck() {
+	for _, check := range EnterpriseCheckFuncs {
+		check()
+	}
+}
+
+// ServerUpdate - updates the server
+// replaces legacy Checkin code
+func ServerUpdate(serverNode *models.Node, ifaceDelta bool) error {
+	if !IsLocalServer(serverNode) {
+		logger.Log(1, "skipping server update as not the leader")
+		return nil
 	}
 
-	newNode, err = ServerPull(&serverNode, false)
+	var err = ServerPull(serverNode, ifaceDelta)
 	if isDeleteError(err) {
-		return ServerLeave(mac, network)
-	} else if err != nil {
-		return err
+		return DeleteNodeByID(serverNode, true)
+	} else if err != nil && !ifaceDelta {
+		err = ServerPull(serverNode, true)
+		if err != nil {
+			return err
+		}
 	}
 
-	actionCompleted := checkNodeActions(newNode, network, &serverNode)
+	actionCompleted := checkNodeActions(serverNode)
 	if actionCompleted == models.NODE_DELETE {
 		return errors.New("node has been removed")
 	}
 
-	return ServerPush(newNode)
-}
-
-// ServerPull - pulls current config/peers for server
-func ServerPull(serverNode *models.Node, onErr bool) (*models.Node, error) {
-
-	var err error
-	if serverNode.IPForwarding == "yes" {
-		if err = setIPForwardingLinux(); err != nil {
-			return serverNode, err
-		}
-	}
-	serverNode.OS = runtime.GOOS
-
-	if serverNode.PullChanges == "yes" || onErr {
-		// check for interface change
-		var isIfacePresent bool
-		var oldIfaceName string
-		// checks if address is in use by another interface
-		oldIfaceName, isIfacePresent = isInterfacePresent(serverNode.Interface, serverNode.Address)
-		if !isIfacePresent {
-			if err = deleteInterface(oldIfaceName, serverNode.PostDown); err != nil {
-				Log("could not delete old interface "+oldIfaceName, 1)
-			}
-			Log("removed old interface "+oldIfaceName, 1)
-		}
-		serverNode.PullChanges = "no"
-		if err = setWGConfig(*serverNode, serverNode.Network, false); err != nil {
-			return serverNode, err
-		}
-		// handle server side update
-		if err = UpdateNode(serverNode, serverNode); err != nil {
-			return serverNode, err
-		}
-	} else {
-		if err = setWGConfig(*serverNode, serverNode.Network, true); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return ServerPull(serverNode, true)
-			} else {
-				return serverNode, err
-			}
-		}
-	}
-
-	return serverNode, nil
-}
-
-// ServerPush - pushes config changes for server checkins/join
-func ServerPush(serverNode *models.Node) error {
-	serverNode.OS = runtime.GOOS
-	serverNode.SetLastCheckIn()
-	return UpdateNode(serverNode, serverNode)
-}
-
-// ServerLeave - removes a server node
-func ServerLeave(mac string, network string) error {
-
-	var serverNode models.Node
-	var err error
-	serverNode, err = GetNode(mac, network)
-	if err != nil {
-		return err
-	}
-	serverNode.SetID()
-	return DeleteNode(&serverNode, true)
-}
-
-// GetServerPeers - gets peers of server
-func GetServerPeers(macaddress string, network string, dualstack bool, isIngressGateway bool) ([]wgtypes.PeerConfig, bool, []string, error) {
-	hasGateway := false
-	var err error
-	var gateways []string
-	var peers []wgtypes.PeerConfig
-	var nodecfg models.Node
-	var nodes []models.Node // fill above fields from server or client
-
-	nodecfg, err = GetNode(macaddress, network)
-	if err != nil {
-		return nil, hasGateway, gateways, err
-	}
-	nodes, err = GetPeers(nodecfg)
-	if err != nil {
-		return nil, hasGateway, gateways, err
-	}
-
-	keepalive := nodecfg.PersistentKeepalive
-	keepalivedur, err := time.ParseDuration(strconv.FormatInt(int64(keepalive), 10) + "s")
-	keepaliveserver, err := time.ParseDuration(strconv.FormatInt(int64(5), 10) + "s")
-	if err != nil {
-		Log("Issue with format of keepalive value. Please view server config. "+err.Error(), 1)
-		return nil, hasGateway, gateways, err
-	}
-
-	for _, node := range nodes {
-		pubkey, err := wgtypes.ParseKey(node.PublicKey)
-		if err != nil {
-			Log("error parsing key "+pubkey.String(), 1)
-			return peers, hasGateway, gateways, err
-		}
-
-		if nodecfg.PublicKey == node.PublicKey {
-			continue
-		}
-		if nodecfg.Endpoint == node.Endpoint {
-			if nodecfg.LocalAddress != node.LocalAddress && node.LocalAddress != "" {
-				node.Endpoint = node.LocalAddress
-			} else {
-				continue
-			}
-		}
-
-		var peer wgtypes.PeerConfig
-		var peeraddr = net.IPNet{
-			IP:   net.ParseIP(node.Address),
-			Mask: net.CIDRMask(32, 32),
-		}
-		var allowedips []net.IPNet
-		allowedips = append(allowedips, peeraddr)
-		// handle manually set peers
-		for _, allowedIp := range node.AllowedIPs {
-			if _, ipnet, err := net.ParseCIDR(allowedIp); err == nil {
-				nodeEndpointArr := strings.Split(node.Endpoint, ":")
-				if !ipnet.Contains(net.IP(nodeEndpointArr[0])) && ipnet.IP.String() != node.Address { // don't need to add an allowed ip that already exists..
-					allowedips = append(allowedips, *ipnet)
-				}
-			} else if appendip := net.ParseIP(allowedIp); appendip != nil && allowedIp != node.Address {
-				ipnet := net.IPNet{
-					IP:   net.ParseIP(allowedIp),
-					Mask: net.CIDRMask(32, 32),
-				}
-				allowedips = append(allowedips, ipnet)
-			}
-		}
-		// handle egress gateway peers
-		if node.IsEgressGateway == "yes" {
-			hasGateway = true
-			ranges := node.EgressGatewayRanges
-			for _, iprange := range ranges { // go through each cidr for egress gateway
-				_, ipnet, err := net.ParseCIDR(iprange) // confirming it's valid cidr
-				if err != nil {
-					Log("could not parse gateway IP range. Not adding "+iprange, 1)
-					continue // if can't parse CIDR
-				}
-				nodeEndpointArr := strings.Split(node.Endpoint, ":") // getting the public ip of node
-				if ipnet.Contains(net.ParseIP(nodeEndpointArr[0])) { // ensuring egress gateway range does not contain public ip of node
-					Log("egress IP range of "+iprange+" overlaps with "+node.Endpoint+", omitting", 2)
-					continue // skip adding egress range if overlaps with node's ip
-				}
-				if ipnet.Contains(net.ParseIP(nodecfg.LocalAddress)) { // ensuring egress gateway range does not contain public ip of node
-					Log("egress IP range of "+iprange+" overlaps with "+nodecfg.LocalAddress+", omitting", 2)
-					continue // skip adding egress range if overlaps with node's local ip
-				}
-				gateways = append(gateways, iprange)
-				if err != nil {
-					Log("ERROR ENCOUNTERED SETTING GATEWAY", 1)
-				} else {
-					allowedips = append(allowedips, *ipnet)
-				}
-			}
-		}
-		if node.Address6 != "" && dualstack {
-			var addr6 = net.IPNet{
-				IP:   net.ParseIP(node.Address6),
-				Mask: net.CIDRMask(128, 128),
-			}
-			allowedips = append(allowedips, addr6)
-		}
-		if nodecfg.IsServer == "yes" && !(node.IsServer == "yes") {
-			peer = wgtypes.PeerConfig{
-				PublicKey:                   pubkey,
-				PersistentKeepaliveInterval: &keepaliveserver,
-				ReplaceAllowedIPs:           true,
-				AllowedIPs:                  allowedips,
-			}
-		} else if keepalive != 0 {
-			peer = wgtypes.PeerConfig{
-				PublicKey:                   pubkey,
-				PersistentKeepaliveInterval: &keepalivedur,
-				Endpoint: &net.UDPAddr{
-					IP:   net.ParseIP(node.Endpoint),
-					Port: int(node.ListenPort),
-				},
-				ReplaceAllowedIPs: true,
-				AllowedIPs:        allowedips,
-			}
-		} else {
-			peer = wgtypes.PeerConfig{
-				PublicKey: pubkey,
-				Endpoint: &net.UDPAddr{
-					IP:   net.ParseIP(node.Endpoint),
-					Port: int(node.ListenPort),
-				},
-				ReplaceAllowedIPs: true,
-				AllowedIPs:        allowedips,
-			}
-		}
-		peers = append(peers, peer)
-	}
-	if isIngressGateway {
-		extPeers, err := GetServerExtPeers(macaddress, network, dualstack)
-		if err == nil {
-			peers = append(peers, extPeers...)
-		} else {
-			Log("ERROR RETRIEVING EXTERNAL PEERS ON SERVER", 1)
-		}
-	}
-	return peers, hasGateway, gateways, err
-}
-
-// GetServerExtPeers - gets the extpeers for a client
-func GetServerExtPeers(macaddress string, network string, dualstack bool) ([]wgtypes.PeerConfig, error) {
-	var peers []wgtypes.PeerConfig
-	var nodecfg models.Node
-	var extPeers []models.Node
-	var err error
-	// fill above fields from either client or server
-
-	nodecfg, err = GetNode(macaddress, network)
-	if err != nil {
-		return nil, err
-	}
-	var tempPeers []models.ExtPeersResponse
-	tempPeers, err = GetExtPeersList(nodecfg.MacAddress, nodecfg.Network)
-	if err != nil {
-		return nil, err
-	}
-	for i := 0; i < len(tempPeers); i++ {
-		extPeers = append(extPeers, models.Node{
-			Address:             tempPeers[i].Address,
-			Address6:            tempPeers[i].Address6,
-			Endpoint:            tempPeers[i].Endpoint,
-			PublicKey:           tempPeers[i].PublicKey,
-			PersistentKeepalive: tempPeers[i].KeepAlive,
-			ListenPort:          tempPeers[i].ListenPort,
-			LocalAddress:        tempPeers[i].LocalAddress,
-		})
-	}
-	for _, extPeer := range extPeers {
-		pubkey, err := wgtypes.ParseKey(extPeer.PublicKey)
-		if err != nil {
-			return peers, err
-		}
-
-		if nodecfg.PublicKey == extPeer.PublicKey {
-			continue
-		}
-
-		var peer wgtypes.PeerConfig
-		var peeraddr = net.IPNet{
-			IP:   net.ParseIP(extPeer.Address),
-			Mask: net.CIDRMask(32, 32),
-		}
-		var allowedips []net.IPNet
-		allowedips = append(allowedips, peeraddr)
-
-		if extPeer.Address6 != "" && dualstack {
-			var addr6 = net.IPNet{
-				IP:   net.ParseIP(extPeer.Address6),
-				Mask: net.CIDRMask(128, 128),
-			}
-			allowedips = append(allowedips, addr6)
-		}
-		peer = wgtypes.PeerConfig{
-			PublicKey:         pubkey,
-			ReplaceAllowedIPs: true,
-			AllowedIPs:        allowedips,
-		}
-		peers = append(peers, peer)
-	}
-	return peers, err
+	return serverPush(serverNode)
 }
 
 // == Private ==
@@ -444,21 +215,131 @@ func isDeleteError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), models.NODE_DELETE)
 }
 
-func checkNodeActions(node *models.Node, networkName string, localNode *models.Node) string {
-	if (node.Action == models.NODE_UPDATE_KEY || localNode.Action == models.NODE_UPDATE_KEY) &&
-		node.IsStatic != "yes" {
-		err := setWGKeyConfig(*node)
+func checkNodeActions(node *models.Node) string {
+	if node.Action == models.NODE_UPDATE_KEY {
+		err := setWGKeyConfig(node)
 		if err != nil {
-			Log("unable to process reset keys request: "+err.Error(), 1)
+			logger.Log(1, "unable to process reset keys request:", err.Error())
 			return ""
 		}
 	}
-	if node.Action == models.NODE_DELETE || localNode.Action == models.NODE_DELETE {
-		err := ServerLeave(node.MacAddress, networkName)
+	if node.Action == models.NODE_DELETE {
+		err := DeleteNodeByID(node, true)
 		if err != nil {
-			Log("error deleting locally: "+err.Error(), 1)
+			logger.Log(1, "error deleting locally:", err.Error())
 		}
 		return models.NODE_DELETE
 	}
 	return ""
+}
+
+// == Private ==
+
+// ServerPull - performs a server pull
+func ServerPull(serverNode *models.Node, ifaceDelta bool) error {
+	if serverNode.IsServer != "yes" {
+		return fmt.Errorf("attempted pull from non-server node: %s - %s", serverNode.Name, serverNode.ID)
+	}
+
+	var err error
+	if serverNode.IPForwarding == "yes" {
+		if err = setIPForwardingLinux(); err != nil {
+			return err
+		}
+	}
+	serverNode.OS = runtime.GOOS
+
+	if ifaceDelta {
+		// check for interface change
+		// checks if address is in use by another interface
+		var oldIfaceName, isIfacePresent = isInterfacePresent(serverNode.Interface, serverNode.Address)
+		if !isIfacePresent {
+			if err = deleteInterface(oldIfaceName, serverNode.PostDown); err != nil {
+				logger.Log(1, "could not delete old interface", oldIfaceName)
+			}
+			logger.Log(1, "removed old interface", oldIfaceName)
+		}
+		if err = setWGConfig(serverNode, false); err != nil {
+			return err
+		}
+		// handle server side update
+		if err = UpdateNode(serverNode, serverNode); err != nil {
+			return err
+		}
+	} else {
+		if err = setWGConfig(serverNode, true); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return ServerPull(serverNode, true)
+			} else {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func getServerLocalIP(networkSettings *models.Network) (string, error) {
+
+	var networkCIDR = networkSettings.LocalRange
+	var currentAddresses, _ = net.InterfaceAddrs()
+	var _, currentCIDR, cidrErr = net.ParseCIDR(networkCIDR)
+	if cidrErr != nil {
+		logger.Log(1, "error on server local IP, invalid CIDR provided:", networkCIDR)
+		return "", cidrErr
+	}
+	for _, addr := range currentAddresses {
+		ip, _, err := net.ParseCIDR(addr.String())
+		if err != nil {
+			continue
+		}
+		if currentCIDR.Contains(ip) {
+			logger.Log(1, "found local ip on network,", networkSettings.NetID, ", set to", ip.String())
+			return ip.String(), nil
+		}
+	}
+	return "", errors.New("could not find a local ip for server")
+}
+
+func serverPush(serverNode *models.Node) error {
+	serverNode.OS = runtime.GOOS
+	serverNode.SetLastCheckIn()
+	return UpdateNode(serverNode, serverNode)
+}
+
+// AddServerIDIfNotPresent - add's current server ID to DB if not present
+func AddServerIDIfNotPresent() error {
+	currentNodeID := servercfg.GetNodeID()
+	currentServerIDs := models.ServerIDs{}
+
+	record, err := database.FetchRecord(database.SERVERCONF_TABLE_NAME, server_id_key)
+	if err != nil && !database.IsEmptyRecord(err) {
+		return err
+	} else if err == nil {
+		if err = json.Unmarshal([]byte(record), &currentServerIDs); err != nil {
+			return err
+		}
+	}
+
+	if !StringSliceContains(currentServerIDs.ServerIDs, currentNodeID) {
+		currentServerIDs.ServerIDs = append(currentServerIDs.ServerIDs, currentNodeID)
+		data, err := json.Marshal(&currentServerIDs)
+		if err != nil {
+			return err
+		}
+		return database.Insert(server_id_key, string(data), database.SERVERCONF_TABLE_NAME)
+	}
+
+	return nil
+}
+
+// GetServerCount - fetches server count from DB
+func GetServerCount() int {
+	if record, err := database.FetchRecord(database.SERVERCONF_TABLE_NAME, server_id_key); err == nil {
+		currentServerIDs := models.ServerIDs{}
+		if err = json.Unmarshal([]byte(record), &currentServerIDs); err == nil {
+			return len(currentServerIDs.ServerIDs)
+		}
+	}
+	return 1
 }

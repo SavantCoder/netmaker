@@ -1,198 +1,199 @@
-//TODO: Harden. Add failover for every method and agent calls
-//TODO: Figure out why mongodb keeps failing (log rotation?)
-
+// -build ee
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
-	"log"
-	"net"
 	"os"
 	"os/signal"
 	"runtime/debug"
 	"strconv"
 	"sync"
-	"time"
+	"syscall"
 
 	"github.com/gravitl/netmaker/auth"
+	"github.com/gravitl/netmaker/config"
 	controller "github.com/gravitl/netmaker/controllers"
 	"github.com/gravitl/netmaker/database"
 	"github.com/gravitl/netmaker/functions"
-	nodepb "github.com/gravitl/netmaker/grpc"
+	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/logic"
+	"github.com/gravitl/netmaker/logic/pro"
 	"github.com/gravitl/netmaker/models"
+	"github.com/gravitl/netmaker/mq"
 	"github.com/gravitl/netmaker/netclient/ncutils"
 	"github.com/gravitl/netmaker/servercfg"
 	"github.com/gravitl/netmaker/serverctl"
-	"google.golang.org/grpc"
 )
+
+var version = "dev"
 
 // Start DB Connection and start API Request Handler
 func main() {
+	absoluteConfigPath := flag.String("c", "", "absolute path to configuration file")
+	flag.Parse()
+	setupConfig(*absoluteConfigPath)
+	servercfg.SetVersion(version)
 	fmt.Println(models.RetrieveLogo()) // print the logo
-	initialize()                       // initial db and grpc server
+	// fmt.Println(models.ProLogo())
+	initialize() // initial db and acls; gen cert if required
 	setGarbageCollection()
+	setVerbosity()
 	defer database.CloseDB()
-	startControllers() // start the grpc or rest endpoints
+	startControllers() // start the api endpoint and mq
+}
+
+func setupConfig(absoluteConfigPath string) {
+	if len(absoluteConfigPath) > 0 {
+		cfg, err := config.ReadConfig(absoluteConfigPath)
+		if err != nil {
+			logger.Log(0, fmt.Sprintf("failed parsing config at: %s", absoluteConfigPath))
+			return
+		}
+		config.Config = cfg
+	}
 }
 
 func initialize() { // Client Mode Prereq Check
 	var err error
 
-	if err = database.InitializeDatabase(); err != nil {
-		logic.Log("Error connecting to database", 0)
-		log.Fatal(err)
+	if servercfg.GetMasterKey() == "" {
+		logger.Log(0, "warning: MASTER_KEY not set, this could make account recovery difficult")
 	}
-	logic.Log("database successfully connected", 0)
+
+	if servercfg.GetNodeID() == "" {
+		logger.FatalLog("error: must set NODE_ID, currently blank")
+	}
+
+	if err = database.InitializeDatabase(); err != nil {
+		logger.FatalLog("Error connecting to database: ", err.Error())
+	}
+	logger.Log(0, "database successfully connected")
+	if err = logic.AddServerIDIfNotPresent(); err != nil {
+		logger.Log(1, "failed to save server ID")
+	}
+
+	logic.SetJWTSecret()
+
+	if err = pro.InitializeGroups(); err != nil {
+		logger.Log(0, "could not initialize default user group, \"*\"")
+	}
+
+	err = logic.TimerCheckpoint()
+	if err != nil {
+		logger.Log(1, "Timer error occurred: ", err.Error())
+	}
+
+	logic.EnterpriseCheck()
 
 	var authProvider = auth.InitializeAuthProvider()
 	if authProvider != "" {
-		logic.Log("OAuth provider, "+authProvider+", initialized", 0)
+		logger.Log(0, "OAuth provider,", authProvider+",", "initialized")
 	} else {
-		logic.Log("no OAuth provider found or not configured, continuing without OAuth", 0)
+		logger.Log(0, "no OAuth provider found or not configured, continuing without OAuth")
+	}
+
+	err = serverctl.SetDefaults()
+	if err != nil {
+		logger.FatalLog("error setting defaults: ", err.Error())
 	}
 
 	if servercfg.IsClientMode() != "off" {
 		output, err := ncutils.RunCmd("id -u", true)
 		if err != nil {
-			logic.Log("Error running 'id -u' for prereq check. Please investigate or disable client mode.", 0)
-			log.Fatal(output, err)
+			logger.FatalLog("Error running 'id -u' for prereq check. Please investigate or disable client mode.", output, err.Error())
 		}
 		uid, err := strconv.Atoi(string(output[:len(output)-1]))
 		if err != nil {
-			logic.Log("Error retrieving uid from 'id -u' for prereq check. Please investigate or disable client mode.", 0)
-			log.Fatal(err)
+			logger.FatalLog("Error retrieving uid from 'id -u' for prereq check. Please investigate or disable client mode.", err.Error())
 		}
 		if uid != 0 {
-			log.Fatal("To run in client mode requires root privileges. Either disable client mode or run with sudo.")
+			logger.FatalLog("To run in client mode requires root privileges. Either disable client mode or run with sudo.")
 		}
 		if err := serverctl.InitServerNetclient(); err != nil {
-			log.Fatal("Did not find netclient to use CLIENT_MODE")
+			logger.FatalLog("Did not find netclient to use CLIENT_MODE")
+		}
+	}
+	// initialize iptables to ensure gateways work correctly and mq is forwarded if containerized
+	if servercfg.ManageIPTables() != "off" {
+		if err = serverctl.InitIPTables(true); err != nil {
+			logger.FatalLog("Unable to initialize iptables on host:", err.Error())
 		}
 	}
 
 	if servercfg.IsDNSMode() {
 		err := functions.SetDNSDir()
 		if err != nil {
-			log.Fatal(err)
+			logger.FatalLog(err.Error())
+		}
+	}
+
+	if servercfg.IsMessageQueueBackend() {
+		if err = mq.ServerStartNotify(); err != nil {
+			logger.Log(0, "error occurred when notifying nodes of startup", err.Error())
 		}
 	}
 }
 
 func startControllers() {
 	var waitnetwork sync.WaitGroup
-	//Run Agent Server
-	if servercfg.IsAgentBackend() {
-		if !(servercfg.DisableRemoteIPCheck()) && servercfg.GetGRPCHost() == "127.0.0.1" {
-			err := servercfg.SetHost()
-			if err != nil {
-				logic.Log("Unable to Set host. Exiting...", 0)
-				log.Fatal(err)
-			}
-		}
-		waitnetwork.Add(1)
-		go runGRPC(&waitnetwork)
-	}
-
-	if servercfg.IsClientMode() == "on" {
-		waitnetwork.Add(1)
-		go runClient(&waitnetwork)
-	}
-
 	if servercfg.IsDNSMode() {
 		err := logic.SetDNS()
 		if err != nil {
-			logic.Log("error occurred initializing DNS: "+err.Error(), 0)
+			logger.Log(0, "error occurred initializing DNS: ", err.Error())
 		}
 	}
+	if servercfg.IsMessageQueueBackend() {
+		if err := mq.Configure(); err != nil {
+			logger.FatalLog("failed to configure MQ: ", err.Error())
+		}
+	}
+
 	//Run Rest Server
 	if servercfg.IsRestBackend() {
 		if !servercfg.DisableRemoteIPCheck() && servercfg.GetAPIHost() == "127.0.0.1" {
 			err := servercfg.SetHost()
 			if err != nil {
-				logic.Log("Unable to Set host. Exiting...", 0)
-				log.Fatal(err)
+				logger.FatalLog("Unable to Set host. Exiting...", err.Error())
 			}
 		}
 		waitnetwork.Add(1)
-		controller.HandleRESTRequests(&waitnetwork)
+		go controller.HandleRESTRequests(&waitnetwork)
 	}
-	if !servercfg.IsAgentBackend() && !servercfg.IsRestBackend() {
-		logic.Log("No Server Mode selected, so nothing is being served! Set either Agent mode (AGENT_BACKEND) or Rest mode (REST_BACKEND) to 'true'.", 0)
+	//Run MessageQueue
+	if servercfg.IsMessageQueueBackend() {
+		waitnetwork.Add(1)
+		go runMessageQueue(&waitnetwork)
+	}
+
+	if !servercfg.IsAgentBackend() && !servercfg.IsRestBackend() && !servercfg.IsMessageQueueBackend() {
+		logger.Log(0, "No Server Mode selected, so nothing is being served! Set Agent mode (AGENT_BACKEND) or Rest mode (REST_BACKEND) or MessageQueue (MESSAGEQUEUE_BACKEND) to 'true'.")
 	}
 
 	waitnetwork.Wait()
-	logic.Log("exiting", 0)
 }
 
-func runClient(wg *sync.WaitGroup) {
+// Should we be using a context vice a waitgroup????????????
+func runMessageQueue(wg *sync.WaitGroup) {
 	defer wg.Done()
-	go func() {
-		for {
-			if err := serverctl.HandleContainedClient(); err != nil {
-				// PASS
-			}
-			var checkintime = time.Duration(servercfg.GetServerCheckinInterval()) * time.Second
-			time.Sleep(checkintime)
-		}
-	}()
+	brokerHost, secure := servercfg.GetMessageQueueEndpoint()
+	logger.Log(0, "connecting to mq broker at", brokerHost, "with TLS?", fmt.Sprintf("%v", secure))
+	mq.SetUpAdminClient()
+	mq.SetupMQTT()
+	ctx, cancel := context.WithCancel(context.Background())
+	go mq.Keepalive(ctx)
+	go logic.ManageZombies(ctx)
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, os.Interrupt)
+	<-quit
+	cancel()
+	logger.Log(0, "Message Queue shutting down")
 }
 
-func runGRPC(wg *sync.WaitGroup) {
-
-	defer wg.Done()
-
-	// Configure 'log' package to give file name and line number on eg. log.Fatal
-	// Pipe flags to one another (log.LstdFLags = log.Ldate | log.Ltime)
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-
-	grpcport := servercfg.GetGRPCPort()
-
-	listener, err := net.Listen("tcp", ":"+grpcport)
-	// Handle errors if any
-	if err != nil {
-		log.Fatalf("[netmaker] Unable to listen on port "+grpcport+", error: %v", err)
-	}
-
-	s := grpc.NewServer(
-		authServerUnaryInterceptor(),
-	)
-	// Create NodeService type
-	srv := &controller.NodeServiceServer{}
-
-	// Register the service with the server
-	nodepb.RegisterNodeServiceServer(s, srv)
-
-	// Start the server in a child routine
-	go func() {
-		if err := s.Serve(listener); err != nil {
-			log.Fatalf("Failed to serve: %v", err)
-		}
-	}()
-	logic.Log("Agent Server successfully started on port "+grpcport+" (gRPC)", 0)
-
-	// Right way to stop the server using a SHUTDOWN HOOK
-	// Create a channel to receive OS signals
-	c := make(chan os.Signal)
-
-	// Relay os.Interrupt to our channel (os.Interrupt = CTRL+C)
-	// Ignore other incoming signals
-	signal.Notify(c, os.Interrupt)
-
-	// Block main routine until a signal is received
-	// As long as user doesn't press CTRL+C a message is not passed and our main routine keeps running
-	<-c
-
-	// After receiving CTRL+C Properly stop the server
-	logic.Log("Stopping the Agent server...", 0)
-	s.Stop()
-	listener.Close()
-	logic.Log("Agent server closed..", 0)
-	logic.Log("Closed DB connection.", 0)
-}
-
-func authServerUnaryInterceptor() grpc.ServerOption {
-	return grpc.UnaryInterceptor(controller.AuthServerUnaryInterceptor)
+func setVerbosity() {
+	verbose := int(servercfg.GetVerbosity())
+	logger.Verbosity = verbose
 }
 
 func setGarbageCollection() {
@@ -201,7 +202,3 @@ func setGarbageCollection() {
 		debug.SetGCPercent(ncutils.DEFAULT_GC_PERCENT)
 	}
 }
-
-// func authServerStreamInterceptor() grpc.ServerOption {
-// 	return grpc.StreamInterceptor(controller.AuthServerStreamInterceptor)
-// }

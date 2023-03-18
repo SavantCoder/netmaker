@@ -1,31 +1,46 @@
 package functions
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
-	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
-	nodepb "github.com/gravitl/netmaker/grpc"
+	"golang.zx2c4.com/wireguard/wgctrl"
+
+	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/models"
-	"github.com/gravitl/netmaker/netclient/auth"
 	"github.com/gravitl/netmaker/netclient/config"
 	"github.com/gravitl/netmaker/netclient/daemon"
+	"github.com/gravitl/netmaker/netclient/local"
 	"github.com/gravitl/netmaker/netclient/ncutils"
 	"github.com/gravitl/netmaker/netclient/wireguard"
-	"golang.zx2c4.com/wireguard/wgctrl"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
 )
 
-var (
-	wcclient nodepb.NodeServiceClient
-)
+// LINUX_APP_DATA_PATH - linux path
+const LINUX_APP_DATA_PATH = "/etc/netmaker"
+
+// HTTP_TIMEOUT - timeout in seconds for http requests
+const HTTP_TIMEOUT = 30
+
+// HTTPClient - http client to be reused by all
+var HTTPClient http.Client
+
+// SetHTTPClient -sets http client with sane default
+func SetHTTPClient() {
+	HTTPClient = http.Client{
+		Timeout: HTTP_TIMEOUT * time.Second,
+	}
+}
 
 // ListPorts - lists ports of WireGuard devices
 func ListPorts() error {
@@ -33,6 +48,7 @@ func ListPorts() error {
 	if err != nil {
 		return err
 	}
+	defer wgclient.Close()
 	devices, err := wgclient.Devices()
 	if err != nil {
 		return err
@@ -46,23 +62,27 @@ func ListPorts() error {
 
 func getPrivateAddr() (string, error) {
 
-	var local string
+	var localIPStr string
 	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer conn.Close()
+	if err == nil {
+		defer conn.Close()
 
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	localIP := localAddr.IP
-	local = localIP.String()
-	if local == "" {
-		local, err = getPrivateAddrBackup()
+		localAddr := conn.LocalAddr().(*net.UDPAddr)
+		localIP := localAddr.IP
+		localIPStr = localIP.String()
 	}
-	if local == "" {
+	if localIPStr == "" {
+		localIPStr, err = getPrivateAddrBackup()
+	}
+
+	if localIPStr == "" {
 		err = errors.New("could not find local ip")
 	}
-	return local, err
+	if net.ParseIP(localIPStr).To16() != nil {
+		localIPStr = "[" + localIPStr + "]"
+	}
+
+	return localIPStr, err
 }
 
 func getPrivateAddrBackup() (string, error) {
@@ -102,29 +122,41 @@ func getPrivateAddrBackup() (string, error) {
 		}
 	}
 	if !found {
-		err := errors.New("Local Address Not Found.")
+		err := errors.New("local ip address not found")
 		return "", err
 	}
 	return local, err
 }
 
-func needInterfaceUpdate(ctx context.Context, mac string, network string, iface string) (bool, string, error) {
-	var header metadata.MD
-	req := &nodepb.Object{
-		Data: mac + "###" + network,
-		Type: nodepb.STRING_TYPE,
-	}
-	readres, err := wcclient.ReadNode(ctx, req, grpc.Header(&header))
+func getInterfaces() (*[]models.Iface, error) {
+	ifaces, err := net.Interfaces()
 	if err != nil {
-		return false, "", err
+		return nil, err
 	}
-	var resNode models.Node
-	if err := json.Unmarshal([]byte(readres.Data), &resNode); err != nil {
-		return false, iface, err
+	var data []models.Iface
+	var link models.Iface
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue // interface down
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue // loopback interface
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return nil, err
+		}
+		for _, addr := range addrs {
+			link.Name = iface.Name
+			_, cidr, err := net.ParseCIDR(addr.String())
+			if err != nil {
+				continue
+			}
+			link.Address = *cidr
+			data = append(data, link)
+		}
 	}
-	oldiface := resNode.Interface
-
-	return iface != oldiface, oldiface, err
+	return &data, nil
 }
 
 // GetNode - gets node locally
@@ -142,16 +174,18 @@ func GetNode(network string) models.Node {
 func Uninstall() error {
 	networks, err := ncutils.GetSystemNetworks()
 	if err != nil {
-		ncutils.PrintLog("unable to retrieve networks: "+err.Error(), 1)
-		ncutils.PrintLog("continuing uninstall without leaving networks", 1)
+		logger.Log(1, "unable to retrieve networks: ", err.Error())
+		logger.Log(1, "continuing uninstall without leaving networks")
 	} else {
 		for _, network := range networks {
 			err = LeaveNetwork(network)
 			if err != nil {
-				ncutils.PrintLog("Encounter issue leaving network "+network+": "+err.Error(), 1)
+				logger.Log(1, "encounter issue leaving network", network, ":", err.Error())
 			}
 		}
 	}
+	err = nil
+
 	// clean up OS specific stuff
 	if ncutils.IsWindows() {
 		daemon.CleanupWindows()
@@ -159,8 +193,10 @@ func Uninstall() error {
 		daemon.CleanupMac()
 	} else if ncutils.IsLinux() {
 		daemon.CleanupLinux()
+	} else if ncutils.IsFreeBSD() {
+		daemon.CleanupFreebsd()
 	} else if !ncutils.IsKernel() {
-		ncutils.PrintLog("manual cleanup required", 1)
+		logger.Log(1, "manual cleanup required")
 	}
 
 	return err
@@ -172,196 +208,218 @@ func LeaveNetwork(network string) error {
 	if err != nil {
 		return err
 	}
-	servercfg := cfg.Server
-	node := cfg.Node
-
-	if node.IsServer != "yes" {
-		var wcclient nodepb.NodeServiceClient
-		conn, err := grpc.Dial(cfg.Server.GRPCAddress,
-			ncutils.GRPCRequestOpts(cfg.Server.GRPCSSL))
-		if err != nil {
-			log.Printf("Unable to establish client connection to "+servercfg.GRPCAddress+": %v", err)
-		}
-		defer conn.Close()
-		wcclient = nodepb.NewNodeServiceClient(conn)
-
-		ctx, err := auth.SetJWT(wcclient, network)
-		if err != nil {
-			log.Printf("Failed to authenticate: %v", err)
-		} else { // handle client side
-			node.SetID()
-			var header metadata.MD
-			_, err = wcclient.DeleteNode(
-				ctx,
-				&nodepb.Object{
-					Data: node.ID,
-					Type: nodepb.STRING_TYPE,
-				},
-				grpc.Header(&header),
-			)
-			if err != nil {
-				ncutils.PrintLog("encountered error deleting node: "+err.Error(), 1)
-			} else {
-				ncutils.PrintLog("removed machine from "+node.Network+" network on remote server", 1)
-			}
-		}
+	logger.Log(2, "deleting node from server")
+	if err := deleteNodeFromServer(cfg); err != nil {
+		logger.Log(0, "error deleting node from server", err.Error())
 	}
-	//extra network route setting required for freebsd and windows
-	if ncutils.IsWindows() {
-		ip, mask, err := ncutils.GetNetworkIPMask(node.NetworkSettings.AddressRange)
-		if err != nil {
-			ncutils.PrintLog(err.Error(), 1)
-		}
-		_, _ = ncutils.RunCmd("route delete "+ip+" mask "+mask+" "+node.Address, true)
-	} else if ncutils.IsFreeBSD() {
-		_, _ = ncutils.RunCmd("route del -net "+node.NetworkSettings.AddressRange+" -interface "+node.Interface, true)
+	logger.Log(2, "deleting wireguard interface")
+	if err := deleteLocalNetwork(cfg); err != nil {
+		logger.Log(0, "error deleting wireguard interface", err.Error())
 	}
-	return RemoveLocalInstance(cfg, network)
+	logger.Log(2, "deleting configuration files")
+	if err := WipeLocal(cfg); err != nil {
+		logger.Log(0, "error deleting local network files", err.Error())
+	}
+	logger.Log(2, "removing dns entries")
+	if err := removeHostDNS(cfg.Node.Interface, ncutils.IsWindows()); err != nil {
+		logger.Log(0, "failed to delete dns entries for", cfg.Node.Interface, err.Error())
+	}
+	logger.Log(2, "restarting daemon")
+	return daemon.Restart()
 }
 
-// RemoveLocalInstance - remove all netclient files locally for a network
-func RemoveLocalInstance(cfg *config.ClientConfig, networkName string) error {
-	err := WipeLocal(networkName)
-	if err != nil {
-		ncutils.PrintLog("unable to wipe local config", 1)
-	} else {
-		ncutils.PrintLog("removed "+networkName+" network locally", 1)
+func deleteNodeFromServer(cfg *config.ClientConfig) error {
+	node := cfg.Node
+	if node.IsServer == "yes" {
+		return errors.New("attempt to delete server node ... not permitted")
 	}
-	if cfg.Daemon != "off" {
-		if ncutils.IsWindows() {
-			// TODO: Remove job?
-		} else if ncutils.IsMac() {
-			//TODO: Delete mac daemon
-		} else {
-			err = daemon.RemoveSystemDServices()
+	token, err := Authenticate(cfg)
+	if err != nil {
+		return fmt.Errorf("unable to authenticate %w", err)
+	}
+	url := "https://" + cfg.Server.API + "/api/nodes/" + cfg.Network + "/" + cfg.Node.ID
+	response, err := API("", http.MethodDelete, url, token)
+	if err != nil {
+		return fmt.Errorf("error deleting node on server: %w", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		bodybytes, _ := io.ReadAll(response.Body)
+		defer response.Body.Close()
+		return fmt.Errorf("error deleting node from network %s on server %s %s", cfg.Network, response.Status, string(bodybytes))
+	}
+	return nil
+}
+
+func deleteLocalNetwork(cfg *config.ClientConfig) error {
+	wgClient, wgErr := wgctrl.New()
+	if wgErr != nil {
+		return wgErr
+	}
+	removeIface := cfg.Node.Interface
+	queryAddr := cfg.Node.PrimaryAddress()
+	if ncutils.IsMac() {
+		var macIface string
+		macIface, wgErr = local.GetMacIface(queryAddr)
+		if wgErr == nil && removeIface != "" {
+			removeIface = macIface
 		}
 	}
-	return err
+	dev, devErr := wgClient.Device(removeIface)
+	if devErr != nil {
+		return fmt.Errorf("error flushing routes %w", devErr)
+	}
+	local.FlushPeerRoutes(removeIface, queryAddr, dev.Peers[:])
+	_, cidr, cidrErr := net.ParseCIDR(cfg.NetworkSettings.AddressRange)
+	if cidrErr != nil {
+		return fmt.Errorf("error flushing routes %w", cidrErr)
+	}
+	local.RemoveCIDRRoute(removeIface, queryAddr, cidr)
+	return nil
 }
 
 // DeleteInterface - delete an interface of a network
 func DeleteInterface(ifacename string, postdown string) error {
-	var err error
-	if !ncutils.IsKernel() {
-		err = wireguard.RemoveConf(ifacename, true)
-	} else {
-		ipExec, errN := exec.LookPath("ip")
-		err = errN
-		if err != nil {
-			ncutils.PrintLog(err.Error(), 1)
-		}
-		_, err = ncutils.RunCmd(ipExec+" link del "+ifacename, false)
-		if postdown != "" {
-			runcmds := strings.Split(postdown, "; ")
-			err = ncutils.RunCmds(runcmds, true)
-		}
-	}
-	return err
+	return wireguard.RemoveConf(ifacename, true)
 }
 
 // WipeLocal - wipes local instance
-func WipeLocal(network string) error {
-	cfg, err := config.ReadConfig(network)
+func WipeLocal(cfg *config.ClientConfig) error {
+	if err := wireguard.RemoveConf(cfg.Node.Interface, true); err == nil {
+		logger.Log(1, "network:", cfg.Node.Network, "removed WireGuard interface: ", cfg.Node.Interface)
+	} else if strings.Contains(err.Error(), "does not exist") {
+		err = nil
+	}
+	dir := ncutils.GetNetclientPathSpecific()
+	fail := false
+	files, err := filepath.Glob(dir + "*" + cfg.Node.Network)
+	if err != nil {
+		logger.Log(0, "no matching files", err.Error())
+		fail = true
+	}
+	for _, file := range files {
+		if err := os.Remove(file); err != nil {
+			logger.Log(0, "failed to delete file", file, err.Error())
+			fail = true
+		}
+	}
+
+	if cfg.Node.Interface != "" {
+		if ncutils.FileExists(dir + cfg.Node.Interface + ".conf") {
+			if err := os.Remove(dir + cfg.Node.Interface + ".conf"); err != nil {
+				logger.Log(0, err.Error())
+				fail = true
+			}
+		}
+	}
+	if fail {
+		return errors.New("not all files were deleted")
+	}
+	return nil
+}
+
+// GetNetmakerPath - gets netmaker path locally
+func GetNetmakerPath() string {
+	return LINUX_APP_DATA_PATH
+}
+
+// API function to interact with netmaker api endpoints. response from endpoint is returned
+func API(data any, method, url, authorization string) (*http.Response, error) {
+	var request *http.Request
+	var err error
+	if data != "" {
+		payload, err := json.Marshal(data)
+		if err != nil {
+			return nil, fmt.Errorf("error encoding data %w", err)
+		}
+		request, err = http.NewRequest(method, url, bytes.NewBuffer(payload))
+		if err != nil {
+			return nil, fmt.Errorf("error creating http request %w", err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+	} else {
+		request, err = http.NewRequest(method, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("error creating http request %w", err)
+		}
+	}
+	if authorization != "" {
+		request.Header.Set("authorization", "Bearer "+authorization)
+	}
+	request.Header.Set("requestfrom", "node")
+	return HTTPClient.Do(request)
+}
+
+// Authenticate authenticates with api to permit subsequent interactions with the api
+func Authenticate(cfg *config.ClientConfig) (string, error) {
+
+	pass, err := os.ReadFile(ncutils.GetNetclientPathSpecific() + "secret-" + cfg.Network)
+	if err != nil {
+		return "", fmt.Errorf("could not read secrets file %w", err)
+	}
+	data := models.AuthParams{
+		MacAddress: cfg.Node.MacAddress,
+		ID:         cfg.Node.ID,
+		Password:   string(pass),
+	}
+	url := "https://" + cfg.Server.API + "/api/nodes/adm/" + cfg.Network + "/authenticate"
+	response, err := API(data, http.MethodPost, url, "")
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		bodybytes, _ := io.ReadAll(response.Body)
+		return "", fmt.Errorf("failed to authenticate %s %s", response.Status, string(bodybytes))
+	}
+	resp := models.SuccessResponse{}
+	if err := json.NewDecoder(response.Body).Decode(&resp); err != nil {
+		return "", fmt.Errorf("error decoding respone %w", err)
+	}
+	tokenData := resp.Response.(map[string]interface{})
+	token := tokenData["AuthToken"]
+	return token.(string), nil
+}
+
+// RegisterWithServer calls the register endpoint with privatekey and commonname - api returns ca and client certificate
+func SetServerInfo(cfg *config.ClientConfig) error {
+	cfg, err := config.ReadConfig(cfg.Network)
 	if err != nil {
 		return err
 	}
-	nodecfg := cfg.Node
-	ifacename := nodecfg.Interface
-	if ifacename != "" {
-		if !ncutils.IsKernel() {
-			if err = wireguard.RemoveConf(ifacename, true); err == nil {
-				ncutils.PrintLog("removed WireGuard interface: "+ifacename, 1)
-			}
-		} else {
-			ipExec, err := exec.LookPath("ip")
-			if err != nil {
-				return err
-			}
-			out, err := ncutils.RunCmd(ipExec+" link del "+ifacename, false)
-			dontprint := strings.Contains(out, "does not exist") || strings.Contains(out, "Cannot find device")
-			if err != nil && !dontprint {
-				ncutils.PrintLog("error running command: "+ipExec+" link del "+ifacename, 1)
-				ncutils.PrintLog(out, 1)
-			}
-			if nodecfg.PostDown != "" {
-				runcmds := strings.Split(nodecfg.PostDown, "; ")
-				_ = ncutils.RunCmds(runcmds, false)
-			}
-		}
+	url := "https://" + cfg.Server.API + "/api/server/getserverinfo"
+	logger.Log(1, "server at "+url)
+
+	token, err := Authenticate(cfg)
+	if err != nil {
+		return err
 	}
-	home := ncutils.GetNetclientPathSpecific()
-	if ncutils.FileExists(home + "netconfig-" + network) {
-		_ = os.Remove(home + "netconfig-" + network)
+	response, err := API("", http.MethodGet, url, token)
+	if err != nil {
+		return err
 	}
-	if ncutils.FileExists(home + "backup.netconfig-" + network) {
-		_ = os.Remove(home + "backup.netconfig-" + network)
+	if response.StatusCode != http.StatusOK {
+		return errors.New(response.Status)
 	}
-	if ncutils.FileExists(home + "nettoken-" + network) {
-		_ = os.Remove(home + "nettoken-" + network)
+	var resp models.ServerConfig
+	if err := json.NewDecoder(response.Body).Decode(&resp); err != nil {
+		return errors.New("unmarshal cert error " + err.Error())
 	}
-	if ncutils.FileExists(home + "secret-" + network) {
-		_ = os.Remove(home + "secret-" + network)
+
+	// set broker information on register
+	cfg.Server.Server = resp.Server
+	cfg.Server.MQPort = resp.MQPort
+
+	if err = config.ModServerConfig(&cfg.Server, cfg.Node.Network); err != nil {
+		logger.Log(0, "error overwriting config with broker information: "+err.Error())
 	}
-	if ncutils.FileExists(home + "wgkey-" + network) {
-		_ = os.Remove(home + "wgkey-" + network)
-	}
-	if ncutils.FileExists(home + "nm-" + network + ".conf") {
-		_ = os.Remove(home + "nm-" + network + ".conf")
-	}
-	return err
+
+	return nil
 }
 
-func getLocalIP(node models.Node) string {
-
-	var local string
-
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return local
+func informPortChange(node *models.Node) {
+	if node.ListenPort == 0 {
+		logger.Log(0, "network:", node.Network, "UDP hole punching enabled for node", node.Name)
+	} else {
+		logger.Log(0, "network:", node.Network, "node", node.Name, "is using port", strconv.Itoa(int(node.ListenPort)))
 	}
-	_, localrange, err := net.ParseCIDR(node.LocalRange)
-	if err != nil {
-		return local
-	}
-
-	found := false
-	for _, i := range ifaces {
-		if i.Flags&net.FlagUp == 0 {
-			continue // interface down
-		}
-		if i.Flags&net.FlagLoopback != 0 {
-			continue // loopback interface
-		}
-		addrs, err := i.Addrs()
-		if err != nil {
-			return local
-		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				if !found {
-					ip = v.IP
-					local = ip.String()
-					if node.IsLocal == "yes" {
-						found = localrange.Contains(ip)
-					} else {
-						found = true
-					}
-				}
-			case *net.IPAddr:
-				if !found {
-					ip = v.IP
-					local = ip.String()
-					if node.IsLocal == "yes" {
-						found = localrange.Contains(ip)
-
-					} else {
-						found = true
-					}
-				}
-			}
-		}
-	}
-	return local
 }

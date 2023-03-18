@@ -2,19 +2,22 @@
 package logic
 
 import (
+	crand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
-	"log"
+	"fmt"
+	"math/big"
 	"math/rand"
-	"strconv"
+	"net"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/c-robinson/iplib"
 	"github.com/gravitl/netmaker/database"
+	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/models"
 	"github.com/gravitl/netmaker/netclient/ncutils"
-	"github.com/gravitl/netmaker/servercfg"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // IsBase64 - checks if a string is in base64 format
@@ -30,113 +33,36 @@ func CheckEndpoint(endpoint string) bool {
 	return len(endpointarr) == 2
 }
 
-// SetNetworkServerPeers - sets the network server peers of a given node
-func SetNetworkServerPeers(node *models.Node) {
-	if currentPeersList, err := GetSystemPeers(node); err == nil {
-		if database.SetPeers(currentPeersList, node.Network) {
-			Log("set new peers on network "+node.Network, 1)
-		}
-	} else {
-		Log("could not set peers on network "+node.Network+"\n"+err.Error(), 1)
+// FileExists - checks if local file exists
+func FileExists(f string) bool {
+	info, err := os.Stat(f)
+	if os.IsNotExist(err) {
+		return false
 	}
+	return !info.IsDir()
 }
 
-// DeleteNode - deletes a node from database or moves into delete nodes table
-func DeleteNode(node *models.Node, exterminate bool) error {
-	var err error
-	node.SetID()
-	var key = node.ID
-	if !exterminate {
-		args := strings.Split(key, "###")
-		node, err := GetNode(args[0], args[1])
-		if err != nil {
-			return err
-		}
-		node.Action = models.NODE_DELETE
-		nodedata, err := json.Marshal(&node)
-		if err != nil {
-			return err
-		}
-		err = database.Insert(key, string(nodedata), database.DELETED_NODES_TABLE_NAME)
-		if err != nil {
-			return err
-		}
+// IsAddressInCIDR - util to see if an address is in a cidr or not
+func IsAddressInCIDR(address, cidr string) bool {
+	var _, currentCIDR, cidrErr = net.ParseCIDR(cidr)
+	if cidrErr != nil {
+		return false
+	}
+	var addrParts = strings.Split(address, ".")
+	var addrPartLength = len(addrParts)
+	if addrPartLength != 4 {
+		return false
 	} else {
-		if err := database.DeleteRecord(database.DELETED_NODES_TABLE_NAME, key); err != nil {
-			Log(err.Error(), 2)
+		if addrParts[addrPartLength-1] == "0" ||
+			addrParts[addrPartLength-1] == "255" {
+			return false
 		}
 	}
-	if err = database.DeleteRecord(database.NODES_TABLE_NAME, key); err != nil {
-		return err
-	}
-	if servercfg.IsDNSMode() {
-		err = SetDNS()
-	}
-	return removeLocalServer(node)
-}
-
-// CreateNode - creates a node in database
-func CreateNode(node models.Node, networkName string) (models.Node, error) {
-
-	//encrypt that password so we never see it
-	hash, err := bcrypt.GenerateFromPassword([]byte(node.Password), 5)
-
+	ip, _, err := net.ParseCIDR(fmt.Sprintf("%s/32", address))
 	if err != nil {
-		return node, err
+		return false
 	}
-	//set password to encrypted password
-	node.Password = string(hash)
-
-	node.Network = networkName
-	if node.Name == models.NODE_SERVER_NAME {
-		node.IsServer = "yes"
-	}
-	if node.DNSOn == "" {
-		if servercfg.IsDNSMode() {
-			node.DNSOn = "yes"
-		} else {
-			node.DNSOn = "no"
-		}
-	}
-	SetNodeDefaults(&node)
-	node.Address, err = UniqueAddress(networkName)
-	if err != nil {
-		return node, err
-	}
-	node.Address6, err = UniqueAddress6(networkName)
-	if err != nil {
-		return node, err
-	}
-	//Create a JWT for the node
-	tokenString, _ := CreateJWT(node.MacAddress, networkName)
-	if tokenString == "" {
-		//returnErrorResponse(w, r, errorResponse)
-		return node, err
-	}
-	err = ValidateNode(&node, false)
-	if err != nil {
-		return node, err
-	}
-	key, err := GetRecordKey(node.MacAddress, node.Network)
-	if err != nil {
-		return node, err
-	}
-	nodebytes, err := json.Marshal(&node)
-	if err != nil {
-		return node, err
-	}
-	err = database.Insert(key, string(nodebytes), database.NODES_TABLE_NAME)
-	if err != nil {
-		return node, err
-	}
-	if node.IsPending != "yes" {
-		DecrimentKey(node.Network, node.AccessKey)
-	}
-	SetNetworkNodesLastModified(node.Network)
-	if servercfg.IsDNSMode() {
-		err = SetDNS()
-	}
-	return node, err
+	return currentCIDR.Contains(ip)
 }
 
 // SetNetworkNodesLastModified - sets the network nodes last modified
@@ -160,124 +86,24 @@ func SetNetworkNodesLastModified(networkName string) error {
 	return nil
 }
 
-// GetNode - fetches a node from database
-func GetNode(macaddress string, network string) (models.Node, error) {
-	var node models.Node
-
-	key, err := GetRecordKey(macaddress, network)
-	if err != nil {
-		return node, err
-	}
-	data, err := database.FetchRecord(database.NODES_TABLE_NAME, key)
-	if err != nil {
-		if data == "" {
-			data, err = database.FetchRecord(database.DELETED_NODES_TABLE_NAME, key)
-			err = json.Unmarshal([]byte(data), &node)
-		}
-		return node, err
-	}
-	if err = json.Unmarshal([]byte(data), &node); err != nil {
-		return node, err
-	}
-	SetNodeDefaults(&node)
-
-	return node, err
-}
-
-// GetNodePeers - fetches peers for a given node
-func GetNodePeers(networkName string, excludeRelayed bool) ([]models.Node, error) {
-	var peers []models.Node
-	collection, err := database.FetchRecords(database.NODES_TABLE_NAME)
-	if err != nil {
-		if database.IsEmptyRecord(err) {
-			return peers, nil
-		}
-		Log(err.Error(), 2)
-		return nil, err
-	}
-	udppeers, errN := database.GetPeers(networkName)
-	if errN != nil {
-		Log(errN.Error(), 2)
-	}
-	for _, value := range collection {
-		var node models.Node
-		var peer models.Node
-		err := json.Unmarshal([]byte(value), &node)
+// GenerateCryptoString - generates random string of n length
+func GenerateCryptoString(n int) (string, error) {
+	const chars = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-"
+	ret := make([]byte, n)
+	for i := range ret {
+		num, err := crand.Int(crand.Reader, big.NewInt(int64(len(chars))))
 		if err != nil {
-			Log(err.Error(), 2)
-			continue
+			return "", err
 		}
-		if node.IsEgressGateway == "yes" { // handle egress stuff
-			peer.EgressGatewayRanges = node.EgressGatewayRanges
-			peer.IsEgressGateway = node.IsEgressGateway
-		}
-		allow := node.IsRelayed != "yes" || !excludeRelayed
-
-		if node.Network == networkName && node.IsPending != "yes" && allow {
-			peer = setPeerInfo(node)
-			if node.UDPHolePunch == "yes" && errN == nil && CheckEndpoint(udppeers[node.PublicKey]) {
-				endpointstring := udppeers[node.PublicKey]
-				endpointarr := strings.Split(endpointstring, ":")
-				if len(endpointarr) == 2 {
-					port, err := strconv.Atoi(endpointarr[1])
-					if err == nil {
-						peer.Endpoint = endpointarr[0]
-						peer.ListenPort = int32(port)
-					}
-				}
-			}
-			if node.IsRelay == "yes" {
-				network, err := GetNetwork(networkName)
-				if err == nil {
-					peer.AllowedIPs = append(peer.AllowedIPs, network.AddressRange)
-				} else {
-					peer.AllowedIPs = append(peer.AllowedIPs, node.RelayAddrs...)
-				}
-			}
-			peers = append(peers, peer)
-		}
+		ret[i] = chars[num.Int64()]
 	}
 
-	return peers, err
-}
-
-// GetPeersList - gets the peers of a given network
-func GetPeersList(networkName string, excludeRelayed bool, relayedNodeAddr string) ([]models.Node, error) {
-	var peers []models.Node
-	var relayNode models.Node
-	var err error
-	if relayedNodeAddr == "" {
-		peers, err = GetNodePeers(networkName, excludeRelayed)
-
-	} else {
-		relayNode, err = GetNodeRelay(networkName, relayedNodeAddr)
-		if relayNode.Address != "" {
-			relayNode = setPeerInfo(relayNode)
-			network, err := GetNetwork(networkName)
-			if err == nil {
-				relayNode.AllowedIPs = append(relayNode.AllowedIPs, network.AddressRange)
-			} else {
-				relayNode.AllowedIPs = append(relayNode.AllowedIPs, relayNode.RelayAddrs...)
-			}
-			nodepeers, err := GetNodePeers(networkName, false)
-			if err == nil && relayNode.UDPHolePunch == "yes" {
-				for _, nodepeer := range nodepeers {
-					if nodepeer.Address == relayNode.Address {
-						relayNode.Endpoint = nodepeer.Endpoint
-						relayNode.ListenPort = nodepeer.ListenPort
-					}
-				}
-			}
-
-			peers = append(peers, relayNode)
-		}
-	}
-	return peers, err
+	return string(ret), nil
 }
 
 // RandomString - returns a random string in a charset
 func RandomString(length int) string {
-	const charset = "abcdefghijklmnopqrstuvwxyz" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 	var seededRand *rand.Rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -288,52 +114,115 @@ func RandomString(length int) string {
 	return string(b)
 }
 
-func setPeerInfo(node models.Node) models.Node {
-	var peer models.Node
-	peer.RelayAddrs = node.RelayAddrs
-	peer.IsRelay = node.IsRelay
-	peer.IsServer = node.IsServer
-	peer.IsRelayed = node.IsRelayed
-	peer.PublicKey = node.PublicKey
-	peer.Endpoint = node.Endpoint
-	peer.Name = node.Name
-	peer.LocalAddress = node.LocalAddress
-	peer.ListenPort = node.ListenPort
-	peer.AllowedIPs = node.AllowedIPs
-	peer.UDPHolePunch = node.UDPHolePunch
-	peer.Address = node.Address
-	peer.Address6 = node.Address6
-	peer.EgressGatewayRanges = node.EgressGatewayRanges
-	peer.IsEgressGateway = node.IsEgressGateway
-	peer.IngressGatewayRange = node.IngressGatewayRange
-	peer.IsIngressGateway = node.IsIngressGateway
-	peer.IsPending = node.IsPending
-	return peer
-}
-
-func Log(message string, loglevel int) {
-	log.SetFlags(log.Flags() &^ (log.Llongfile | log.Lshortfile))
-	if int32(loglevel) <= servercfg.GetVerbose() && servercfg.GetVerbose() >= 0 {
-		log.Println("[netmaker] " + message)
-	}
-}
-
 // == Private Methods ==
 
 func setIPForwardingLinux() error {
 	out, err := ncutils.RunCmd("sysctl net.ipv4.ip_forward", true)
 	if err != nil {
-		log.Println("WARNING: Error encountered setting ip forwarding. This can break functionality.")
+		logger.Log(0, "WARNING: Error encountered setting ip forwarding. This can break functionality.")
 		return err
 	} else {
 		s := strings.Fields(string(out))
 		if s[2] != "1" {
 			_, err = ncutils.RunCmd("sysctl -w net.ipv4.ip_forward=1", true)
 			if err != nil {
-				log.Println("WARNING: Error encountered setting ip forwarding. You may want to investigate this.")
+				logger.Log(0, "WARNING: Error encountered setting ip forwarding. You may want to investigate this.")
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// StringSliceContains - sees if a string slice contains a string element
+func StringSliceContains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+// == private ==
+
+// sets the network server peers of a given node
+func setNetworkServerPeers(serverNode *models.Node) {
+	if currentPeersList, err := getSystemPeers(serverNode); err == nil {
+		if currentPeersList == nil {
+			currentPeersList = make(map[string]string)
+		}
+		if database.SetPeers(currentPeersList, serverNode.Network) {
+			logger.Log(1, "set new peers on network", serverNode.Network)
+		}
+	} else {
+		logger.Log(1, "could not set peers on network", serverNode.Network, ":", err.Error())
+	}
+}
+
+// ShouldPublishPeerPorts - Gets ports from iface, sets, and returns true if they are different
+func ShouldPublishPeerPorts(serverNode *models.Node) bool {
+	if currentPeersList, err := getSystemPeers(serverNode); err == nil {
+		if database.SetPeers(currentPeersList, serverNode.Network) {
+			logger.Log(1, "set new peers on network", serverNode.Network)
+			return true
+		}
+	}
+	return false
+}
+
+// NormalCIDR - returns the first address of CIDR
+func NormalizeCIDR(address string) (string, error) {
+	ip, IPNet, err := net.ParseCIDR(address)
+	if err != nil {
+		return "", err
+	}
+	if ip.To4() == nil {
+		net6 := iplib.Net6FromStr(IPNet.String())
+		IPNet.IP = net6.FirstAddress()
+	} else {
+		net4 := iplib.Net4FromStr(IPNet.String())
+		IPNet.IP = net4.NetworkAddress()
+	}
+	return IPNet.String(), nil
+}
+
+func getNetworkProtocols(cidrs []string) (bool, bool) {
+	ipv4 := false
+	ipv6 := false
+	for _, cidr := range cidrs {
+		ip, _, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		if ip.To4() == nil {
+			ipv6 = true
+		} else {
+			ipv4 = true
+		}
+	}
+	return ipv4, ipv6
+}
+
+// StringDifference - returns the elements in `a` that aren't in `b`.
+func StringDifference(a, b []string) []string {
+	mb := make(map[string]struct{}, len(b))
+	for _, x := range b {
+		mb[x] = struct{}{}
+	}
+	var diff []string
+	for _, x := range a {
+		if _, found := mb[x]; !found {
+			diff = append(diff, x)
+		}
+	}
+	return diff
+}
+
+// CheckIfFileExists - checks if file exists or not in the given path
+func CheckIfFileExists(filePath string) bool {
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return false
+	}
+	return true
 }

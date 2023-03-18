@@ -2,17 +2,33 @@ package controller
 
 import (
 	"context"
-	"log"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
-	"github.com/gravitl/netmaker/logic"
+	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/servercfg"
 )
+
+// HttpHandlers - handler functions for REST interactions
+var HttpHandlers = []interface{}{
+	nodeHandlers,
+	userHandlers,
+	networkHandlers,
+	dnsHandlers,
+	fileHandlers,
+	serverHandlers,
+	extClientHandlers,
+	ipHandlers,
+	loggerHandlers,
+}
 
 // HandleRESTRequests - handles the rest requests
 func HandleRESTRequests(wg *sync.WaitGroup) {
@@ -23,16 +39,12 @@ func HandleRESTRequests(wg *sync.WaitGroup) {
 	// Currently allowed dev origin is all. Should change in prod
 	// should consider analyzing the allowed methods further
 	headersOk := handlers.AllowedHeaders([]string{"Access-Control-Allow-Origin", "X-Requested-With", "Content-Type", "authorization"})
-	originsOk := handlers.AllowedOrigins([]string{servercfg.GetAllowedOrigin()})
+	originsOk := handlers.AllowedOrigins(strings.Split(servercfg.GetAllowedOrigin(), ","))
 	methodsOk := handlers.AllowedMethods([]string{"GET", "PUT", "POST", "DELETE"})
 
-	nodeHandlers(r)
-	userHandlers(r)
-	networkHandlers(r)
-	dnsHandlers(r)
-	fileHandlers(r)
-	serverHandlers(r)
-	extClientHandlers(r)
+	for _, handler := range HttpHandlers {
+		handler.(func(*mux.Router))(r)
+	}
 
 	port := servercfg.GetAPIPort()
 
@@ -40,22 +52,23 @@ func HandleRESTRequests(wg *sync.WaitGroup) {
 	go func() {
 		err := srv.ListenAndServe()
 		if err != nil {
-			log.Println(err)
+			logger.Log(0, err.Error())
 		}
 	}()
-	logic.Log("REST Server successfully started on port "+port+" (REST)", 0)
-	c := make(chan os.Signal)
+	logger.Log(0, "REST Server successfully started on port ", port, " (REST)")
 
 	// Relay os.Interrupt to our channel (os.Interrupt = CTRL+C)
 	// Ignore other incoming signals
-	signal.Notify(c, os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.TODO(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
 
 	// Block main routine until a signal is received
 	// As long as user doesn't press CTRL+C a message is not passed and our main routine keeps running
-	<-c
+	<-ctx.Done()
 
 	// After receiving CTRL+C Properly stop the server
-	logic.Log("Stopping the REST server...", 0)
+	logger.Log(0, "Stopping the REST server...")
+	logger.Log(0, "REST Server closed.")
+	logger.DumpFile(fmt.Sprintf("data/netmaker.log.%s", time.Now().Format(logger.TimeFormatDay)))
 	srv.Shutdown(context.TODO())
-	logic.Log("REST Server closed.", 0)
 }

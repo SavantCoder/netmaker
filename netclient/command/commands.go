@@ -1,208 +1,167 @@
 package command
 
 import (
-	"log"
-	"os"
-	"strconv"
+	"errors"
+	"fmt"
 	"strings"
-	"time"
 
-	nodepb "github.com/gravitl/netmaker/grpc"
+	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/netclient/config"
 	"github.com/gravitl/netmaker/netclient/daemon"
 	"github.com/gravitl/netmaker/netclient/functions"
 	"github.com/gravitl/netmaker/netclient/ncutils"
-	"golang.zx2c4.com/wireguard/wgctrl"
 )
 
-var (
-	wgclient *wgctrl.Client
-)
-
-var (
-	wcclient nodepb.NodeServiceClient
-)
-
-func Join(cfg config.ClientConfig, privateKey string) error {
-
+// Join - join command to run from cli
+func Join(cfg *config.ClientConfig, privateKey string) error {
 	var err error
+	//join network
+	if cfg.SsoServer != "" {
+		// User wants to get access key from the OIDC server
+		// Do that before the Joining Network flow by performing the end point auth flow
+		// if performed successfully an access key is obtained from the server and then we
+		// proceed with the usual flow 'pretending' that user is feeded us with an access token
+		if len(cfg.Network) == 0 || cfg.Network == "all" {
+			return fmt.Errorf("no network provided. Specify network with \"-n <net name>\"")
+		}
+		logger.Log(1, "Logging into %s via:", cfg.Network, cfg.SsoServer)
+		err = functions.JoinViaSSo(cfg, privateKey)
+		if err != nil {
+			logger.Log(0, "Join failed: ", err.Error())
+			return err
+		}
+
+		if cfg.AccessKey == "" {
+			return errors.New("login failed")
+		}
+	}
+
+	logger.Log(1, "Joining network: ", cfg.Network)
 	err = functions.JoinNetwork(cfg, privateKey)
-	if err != nil && !cfg.DebugJoin {
+	if err != nil {
 		if !strings.Contains(err.Error(), "ALREADY_INSTALLED") {
-			ncutils.PrintLog("error installing: "+err.Error(), 1)
-			err = functions.LeaveNetwork(cfg.Network)
+			logger.Log(0, "error installing: ", err.Error())
+			err = functions.WipeLocal(cfg)
 			if err != nil {
-				err = functions.WipeLocal(cfg.Network)
-				if err != nil {
-					ncutils.PrintLog("error removing artifacts: "+err.Error(), 1)
-				}
+				logger.Log(1, "error removing artifacts: ", err.Error())
 			}
 			if cfg.Daemon != "off" {
 				if ncutils.IsLinux() {
 					err = daemon.RemoveSystemDServices()
 				}
 				if err != nil {
-					ncutils.PrintLog("error removing services: "+err.Error(), 1)
+					logger.Log(1, "error removing services: ", err.Error())
+				}
+				if ncutils.IsFreeBSD() {
+					daemon.RemoveFreebsdDaemon()
 				}
 			}
-		} else {
-			ncutils.PrintLog("success", 0)
 		}
 		if err != nil && strings.Contains(err.Error(), "ALREADY_INSTALLED") {
-			ncutils.PrintLog(err.Error(), 0)
+			logger.Log(0, err.Error())
 			err = nil
 		}
 		return err
 	}
-	ncutils.PrintLog("joined "+cfg.Network, 1)
-	if cfg.Daemon != "off" {
-		err = daemon.InstallDaemon(cfg)
-	}
+	logger.Log(1, "joined", cfg.Network)
+
 	return err
 }
 
-func getWindowsInterval() int {
-	interval := 15
-	networks, err := ncutils.GetSystemNetworks()
-	if err != nil {
-		return interval
-	}
-	cfg, err := config.ReadConfig(networks[0])
-	if err != nil {
-		return interval
-	}
-	netint, err := strconv.Atoi(cfg.Server.CheckinInterval)
-	if err == nil && netint != 0 {
-		interval = netint
-	}
-	return interval
-}
-
-func RunUserspaceDaemon() {
-
-	cfg := config.ClientConfig{
-		Network: "all",
-	}
-	interval := getWindowsInterval()
-	dur := time.Duration(interval) * time.Second
-	for {
-		if err := CheckIn(cfg); err != nil {
-			// pass
-		}
-		time.Sleep(dur)
-	}
-}
-
-func CheckIn(cfg config.ClientConfig) error {
-	var err error
-	var errN error
-	if cfg.Network == "" {
-		ncutils.PrintLog("required, '-n', exiting", 0)
-		os.Exit(1)
-	} else if cfg.Network == "all" {
-		ncutils.PrintLog("running checkin for all networks", 1)
-		networks, err := ncutils.GetSystemNetworks()
-		if err != nil {
-			ncutils.PrintLog("error retrieving networks, exiting", 1)
-			return err
-		}
-		for _, network := range networks {
-			currConf, err := config.ReadConfig(network)
-			if err != nil {
-				continue
-			}
-			err = functions.CheckConfig(*currConf)
-			if err != nil {
-				ncutils.PrintLog("error checking in for "+network+" network: "+err.Error(), 1)
-			} else {
-				ncutils.PrintLog("checked in successfully for "+network, 1)
-			}
-		}
-		if len(networks) == 0 {
-			if ncutils.IsWindows() { // Windows specific - there are no netclients, so stop daemon process
-				daemon.StopWindowsDaemon()
-			}
-		}
-		errN = err
-		err = nil
-	} else {
-		err = functions.CheckConfig(cfg)
-	}
-	if err == nil && errN != nil {
-		err = errN
-	}
-	return err
-}
-
-func Leave(cfg config.ClientConfig) error {
+// Leave - runs the leave command from cli
+func Leave(cfg *config.ClientConfig) error {
 	err := functions.LeaveNetwork(cfg.Network)
 	if err != nil {
-		ncutils.PrintLog("error attempting to leave network "+cfg.Network, 1)
+		logger.Log(1, "error attempting to leave network "+cfg.Network)
 	} else {
-		ncutils.PrintLog("success", 0)
+		logger.Log(0, "success")
 	}
 	return err
 }
 
-func Push(cfg config.ClientConfig) error {
+// Pull - runs pull command from cli
+func Pull(cfg *config.ClientConfig) error {
 	var err error
-	if cfg.Network == "all" || ncutils.IsWindows() {
-		ncutils.PrintLog("pushing config to server for all networks.", 0)
-		networks, err := ncutils.GetSystemNetworks()
-		if err != nil {
-			ncutils.PrintLog("error retrieving networks, exiting.", 0)
-			return err
-		}
-		for _, network := range networks {
-			err = functions.Push(network)
-			if err != nil {
-				log.Printf("error pushing network configs for "+network+" network: ", err)
-			} else {
-				ncutils.PrintLog("pushed network config for "+network, 1)
-			}
-		}
-		err = nil
-	} else {
-		err = functions.Push(cfg.Network)
-	}
-	ncutils.PrintLog("completed pushing network configs to remote server", 1)
-	ncutils.PrintLog("success", 1)
-	return err
-}
-
-func Pull(cfg config.ClientConfig) error {
-	var err error
+	var networks = []string{}
 	if cfg.Network == "all" {
-		ncutils.PrintLog("No network selected. Running Pull for all networks.", 0)
-		networks, err := ncutils.GetSystemNetworks()
+		logger.Log(0, "No network selected. Running Pull for all networks.")
+		networks, err = ncutils.GetSystemNetworks()
 		if err != nil {
-			ncutils.PrintLog("Error retrieving networks. Exiting.", 1)
+			logger.Log(1, "Error retrieving networks. Exiting.")
 			return err
 		}
-		for _, network := range networks {
-			_, err = functions.Pull(network, true)
-			if err != nil {
-				log.Printf("Error pulling network config for "+network+" network: ", err)
-			} else {
-				ncutils.PrintLog("pulled network config for "+network, 1)
-			}
-		}
-		err = nil
 	} else {
-		_, err = functions.Pull(cfg.Network, true)
+		networks = append(networks, cfg.Network)
 	}
-	ncutils.PrintLog("reset network and peer configs", 1)
-	ncutils.PrintLog("success", 1)
+
+	var currentServers = make(map[string]config.ClientConfig)
+
+	for _, network := range networks {
+		currCfg, err := config.ReadConfig(network)
+		if err != nil {
+			logger.Log(1, "could not read config when pulling for network", network)
+			continue
+		}
+
+		_, err = functions.Pull(network, true)
+		if err != nil {
+			logger.Log(1, "error pulling network config for network: ", network, "\n", err.Error())
+		} else {
+			logger.Log(1, "pulled network config for "+network)
+		}
+
+		currentServers[currCfg.Server.Server] = *currCfg
+	}
+	daemon.Restart()
+	logger.Log(1, "reset network", cfg.Network, "and peer configs")
 	return err
 }
 
+// List - runs list command from cli
 func List(cfg config.ClientConfig) error {
-	err := functions.List(cfg.Network)
+	_, err := functions.List(cfg.Network)
 	return err
 }
 
+// Uninstall - runs uninstall command from cli
 func Uninstall() error {
-	ncutils.PrintLog("uninstalling netclient", 0)
+	logger.Log(0, "uninstalling netclient...")
 	err := functions.Uninstall()
+	logger.Log(0, "uninstalled netclient")
 	return err
+}
+
+// Daemon - runs the daemon
+func Daemon() error {
+	err := functions.Daemon()
+	return err
+}
+
+// Install - installs binary and daemon
+func Install() error {
+	return functions.Install()
+}
+
+// Connect - re-instates a connection of a node
+func Connect(cfg config.ClientConfig) error {
+	networkName := cfg.Network
+	if networkName == "" {
+		networkName = cfg.Node.Network
+	}
+	if networkName == "all" {
+		return fmt.Errorf("no network specified")
+	}
+	return functions.Connect(networkName)
+}
+
+// Disconnect - disconnects a connection of a node
+func Disconnect(cfg config.ClientConfig) error {
+	networkName := cfg.Network
+	if networkName == "" {
+		networkName = cfg.Node.Network
+	}
+	if networkName == "all" {
+		return fmt.Errorf("no network specified")
+	}
+	return functions.Disconnect(networkName)
 }

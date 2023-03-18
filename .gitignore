@@ -3,9 +3,12 @@ netmaker-arm
 netmaker-arm64
 netmaker-32
 netmaker-amd64
+cli/nmctl
 netclient/netclient
+netclient/netclient.syso
 netclient/build
 netclient/build/
+!netclient/build/netclient.service
 netclient/files/netclient
 netclient/netclient-amd64
 netclient/netclient-arm
@@ -14,5 +17,10 @@ netclient/netclient-32
 netclient/netclient32
 netclient/netclient.exe
 config/dnsconfig/
-winsw.exe
+controllers/config/dnsconfig/
+controllers/data/
 data/
+.vscode/
+.idea/
+netmaker.exe
+netmaker.code-workspace

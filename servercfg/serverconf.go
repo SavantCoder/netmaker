@@ -2,14 +2,20 @@ package servercfg
 
 import (
 	"errors"
-	"io/ioutil"
-	"net"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gravitl/netmaker/config"
+	"github.com/gravitl/netmaker/models"
+)
+
+var (
+	Version = "dev"
+	Is_EE   = false
 )
 
 // SetHost - sets the host ip
@@ -29,17 +35,12 @@ func GetServerConfig() config.ServerConfig {
 	cfg.CoreDNSAddr = GetCoreDNSAddr()
 	cfg.APIHost = GetAPIHost()
 	cfg.APIPort = GetAPIPort()
-	cfg.GRPCConnString = GetGRPCConnString()
-	cfg.GRPCHost = GetGRPCHost()
-	cfg.GRPCPort = GetGRPCPort()
+	cfg.MQPort = GetMQPort()
 	cfg.MasterKey = "(hidden)"
 	cfg.DNSKey = "(hidden)"
 	cfg.AllowedOrigin = GetAllowedOrigin()
 	cfg.RestBackend = "off"
-	cfg.Verbosity = GetVerbose()
 	cfg.NodeID = GetNodeID()
-	cfg.CheckinInterval = GetCheckinInterval()
-	cfg.ServerCheckinInterval = GetServerCheckinInterval()
 	if IsRestBackend() {
 		cfg.RestBackend = "on"
 	}
@@ -59,16 +60,8 @@ func GetServerConfig() config.ServerConfig {
 	if IsDisplayKeys() {
 		cfg.DisplayKeys = "on"
 	}
-	cfg.GRPCSSL = "off"
-	if IsGRPCSSL() {
-		cfg.GRPCSSL = "on"
-	}
 	cfg.DisableRemoteIPCheck = "off"
 	if DisableRemoteIPCheck() {
-		cfg.DisableRemoteIPCheck = "on"
-	}
-	cfg.DisableDefaultNet = "off"
-	if DisableDefaultNet() {
 		cfg.DisableRemoteIPCheck = "on"
 	}
 	cfg.Database = GetDB()
@@ -81,6 +74,39 @@ func GetServerConfig() config.ServerConfig {
 	cfg.ClientID = authInfo[1]
 	cfg.ClientSecret = authInfo[2]
 	cfg.FrontendURL = GetFrontendURL()
+	if GetRce() {
+		cfg.RCE = "on"
+	} else {
+		cfg.RCE = "off"
+	}
+	cfg.Telemetry = Telemetry()
+	cfg.ManageIPTables = ManageIPTables()
+	services := strings.Join(GetPortForwardServiceList(), ",")
+	cfg.PortForwardServices = services
+	cfg.Server = GetServer()
+	cfg.Verbosity = GetVerbosity()
+	cfg.IsEE = "no"
+	if Is_EE {
+		cfg.IsEE = "yes"
+	}
+
+	return cfg
+}
+
+// GetServerConfig - gets the server config into memory from file or env
+func GetServerInfo() models.ServerConfig {
+	var cfg models.ServerConfig
+	cfg.API = GetAPIConnString()
+	cfg.CoreDNSAddr = GetCoreDNSAddr()
+	cfg.APIPort = GetAPIPort()
+	cfg.MQPort = GetMQPort()
+	cfg.DNSMode = "off"
+	if IsDNSMode() {
+		cfg.DNSMode = "on"
+	}
+	cfg.Version = GetVersion()
+	cfg.Server = GetServer()
+	cfg.Is_EE = Is_EE
 
 	return cfg
 }
@@ -107,13 +133,14 @@ func GetAPIConnString() string {
 	return conn
 }
 
+// SetVersion - set version of netmaker
+func SetVersion(v string) {
+	Version = v
+}
+
 // GetVersion - version of netmaker
 func GetVersion() string {
-	version := "0.9.1"
-	if config.Config.Server.Version != "" {
-		version = config.Config.Server.Version
-	}
-	return version
+	return Version
 }
 
 // GetDB - gets the database type
@@ -165,17 +192,6 @@ func GetAPIPort() string {
 	return apiport
 }
 
-// GetCheckinInterval - get check in interval for nodes
-func GetCheckinInterval() string {
-	seconds := "15"
-	if os.Getenv("CHECKIN_INTERVAL") != "" {
-		seconds = os.Getenv("CHECKIN_INTERVAL")
-	} else if config.Config.Server.CheckinInterval != "" {
-		seconds = config.Config.Server.CheckinInterval
-	}
-	return seconds
-}
-
 // GetDefaultNodeLimit - get node limit if one is set
 func GetDefaultNodeLimit() int32 {
 	var limit int32
@@ -189,60 +205,48 @@ func GetDefaultNodeLimit() int32 {
 	return limit
 }
 
-// GetGRPCConnString - get grpc conn string
-func GetGRPCConnString() string {
-	conn := ""
-	if os.Getenv("SERVER_GRPC_CONN_STRING") != "" {
-		conn = os.Getenv("SERVER_GRPC_CONN_STRING")
-	} else if config.Config.Server.GRPCConnString != "" {
-		conn = config.Config.Server.GRPCConnString
-	}
-	return conn
-}
-
 // GetCoreDNSAddr - gets the core dns address
 func GetCoreDNSAddr() string {
 	addr, _ := GetPublicIP()
 	if os.Getenv("COREDNS_ADDR") != "" {
 		addr = os.Getenv("COREDNS_ADDR")
 	} else if config.Config.Server.CoreDNSAddr != "" {
-		addr = config.Config.Server.GRPCConnString
+		addr = config.Config.Server.CoreDNSAddr
 	}
 	return addr
 }
 
-// GetGRPCHost - get the grpc host url
-func GetGRPCHost() string {
-	serverhost := "127.0.0.1"
-	remoteip, _ := GetPublicIP()
-	if os.Getenv("SERVER_GRPC_HOST") != "" {
-		serverhost = os.Getenv("SERVER_GRPC_HOST")
-	} else if config.Config.Server.GRPCHost != "" {
-		serverhost = config.Config.Server.GRPCHost
-	} else if os.Getenv("SERVER_HOST") != "" {
-		serverhost = os.Getenv("SERVER_HOST")
-	} else {
-		if remoteip != "" {
-			serverhost = remoteip
-		}
+// GetMQPort - gets the mq port
+func GetMQPort() string {
+	port := "8883" //default
+	if os.Getenv("MQ_PORT") != "" {
+		port = os.Getenv("MQ_PORT")
+	} else if config.Config.Server.MQPort != "" {
+		port = config.Config.Server.MQPort
 	}
-	return serverhost
+	return port
 }
 
-// GetGRPCPort - gets the grpc port
-func GetGRPCPort() string {
-	grpcport := "50051"
-	if os.Getenv("GRPC_PORT") != "" {
-		grpcport = os.Getenv("GRPC_PORT")
-	} else if config.Config.Server.GRPCPort != "" {
-		grpcport = config.Config.Server.GRPCPort
+// GetMessageQueueEndpoint - gets the message queue endpoint
+func GetMessageQueueEndpoint() (string, bool) {
+	host, _ := GetPublicIP()
+	if os.Getenv("MQ_HOST") != "" {
+		host = os.Getenv("MQ_HOST")
+	} else if config.Config.Server.MQHOST != "" {
+		host = config.Config.Server.MQHOST
 	}
-	return grpcport
+	secure := strings.Contains(host, "wss") || strings.Contains(host, "ssl")
+	if secure {
+		host = "wss://" + host
+	} else {
+		host = "ws://" + host
+	}
+	return host + ":" + GetMQServerPort(), secure
 }
 
 // GetMasterKey - gets the configured master key of server
 func GetMasterKey() string {
-	key := "secretkey"
+	key := ""
 	if os.Getenv("MASTER_KEY") != "" {
 		key = os.Getenv("MASTER_KEY")
 	} else if config.Config.Server.MasterKey != "" {
@@ -288,6 +292,21 @@ func IsRestBackend() bool {
 	return isrest
 }
 
+// IsMetricsExporter - checks if metrics exporter is on or off
+func IsMetricsExporter() bool {
+	export := false
+	if os.Getenv("METRICS_EXPORTER") != "" {
+		if os.Getenv("METRICS_EXPORTER") == "on" {
+			export = true
+		}
+	} else if config.Config.Server.MetricsExporter != "" {
+		if config.Config.Server.MetricsExporter == "on" {
+			export = true
+		}
+	}
+	return export
+}
+
 // IsAgentBackend - checks if agent backed is on or off
 func IsAgentBackend() bool {
 	isagent := true
@@ -303,25 +322,83 @@ func IsAgentBackend() bool {
 	return isagent
 }
 
+// IsMessageQueueBackend - checks if message queue is on or off
+func IsMessageQueueBackend() bool {
+	ismessagequeue := true
+	if os.Getenv("MESSAGEQUEUE_BACKEND") != "" {
+		if os.Getenv("MESSAGEQUEUE_BACKEND") == "off" {
+			ismessagequeue = false
+		}
+	} else if config.Config.Server.MessageQueueBackend != "" {
+		if config.Config.Server.MessageQueueBackend == "off" {
+			ismessagequeue = false
+		}
+	}
+	return ismessagequeue
+}
+
 // IsClientMode - checks if it should run in client mode
 func IsClientMode() string {
 	isclient := "on"
-	if os.Getenv("CLIENT_MODE") != "" {
-		if os.Getenv("CLIENT_MODE") == "off" {
-			isclient = "off"
-		}
-		if os.Getenv("CLIENT_MODE") == "contained" {
-			isclient = "contained"
-		}
-	} else if config.Config.Server.ClientMode != "" {
-		if config.Config.Server.ClientMode == "off" {
-			isclient = "off"
-		}
-		if config.Config.Server.ClientMode == "contained" {
-			isclient = "contained"
-		}
+	if os.Getenv("CLIENT_MODE") == "off" {
+		isclient = "off"
+	}
+	if config.Config.Server.ClientMode == "off" {
+		isclient = "off"
 	}
 	return isclient
+}
+
+// Telemetry - checks if telemetry data should be sent
+func Telemetry() string {
+	telemetry := "on"
+	if os.Getenv("TELEMETRY") == "off" {
+		telemetry = "off"
+	}
+	if config.Config.Server.Telemetry == "off" {
+		telemetry = "off"
+	}
+	return telemetry
+}
+
+// ManageIPTables - checks if iptables should be manipulated on host
+func ManageIPTables() string {
+	manage := "on"
+	if os.Getenv("MANAGE_IPTABLES") == "off" {
+		manage = "off"
+	}
+	if config.Config.Server.ManageIPTables == "off" {
+		manage = "off"
+	}
+	return manage
+}
+
+// GetServer - gets the server name
+func GetServer() string {
+	server := ""
+	if os.Getenv("SERVER_NAME") != "" {
+		server = os.Getenv("SERVER_NAME")
+	} else if config.Config.Server.Server != "" {
+		server = config.Config.Server.Server
+	}
+	return server
+}
+
+func GetVerbosity() int32 {
+	var verbosity = 0
+	var err error
+	if os.Getenv("VERBOSITY") != "" {
+		verbosity, err = strconv.Atoi(os.Getenv("VERBOSITY"))
+		if err != nil {
+			verbosity = 0
+		}
+	} else if config.Config.Server.Verbosity != 0 {
+		verbosity = int(config.Config.Server.Verbosity)
+	}
+	if verbosity < 0 || verbosity > 4 {
+		verbosity = 0
+	}
+	return int32(verbosity)
 }
 
 // IsDNSMode - should it run with DNS
@@ -354,21 +431,6 @@ func IsDisplayKeys() bool {
 	return isdisplay
 }
 
-// IsGRPCSSL - ssl grpc on or off
-func IsGRPCSSL() bool {
-	isssl := false
-	if os.Getenv("GRPC_SSL") != "" {
-		if os.Getenv("GRPC_SSL") == "on" {
-			isssl = true
-		}
-	} else if config.Config.Server.DNSMode != "" {
-		if config.Config.Server.DNSMode == "on" {
-			isssl = true
-		}
-	}
-	return isssl
-}
-
 // DisableRemoteIPCheck - disable the remote ip check
 func DisableRemoteIPCheck() bool {
 	disabled := false
@@ -384,21 +446,6 @@ func DisableRemoteIPCheck() bool {
 	return disabled
 }
 
-// DisableDefaultNet - disable default net
-func DisableDefaultNet() bool {
-	disabled := false
-	if os.Getenv("DISABLE_DEFAULT_NET") != "" {
-		if os.Getenv("DISABLE_DEFAULT_NET") == "on" {
-			disabled = true
-		}
-	} else if config.Config.Server.DisableDefaultNet != "" {
-		if config.Config.Server.DisableDefaultNet == "on" {
-			disabled = true
-		}
-	}
-	return disabled
-}
-
 // GetPublicIP - gets public ip
 func GetPublicIP() (string, error) {
 
@@ -406,14 +453,28 @@ func GetPublicIP() (string, error) {
 	var err error
 
 	iplist := []string{"https://ip.server.gravitl.com", "https://ifconfig.me", "https://api.ipify.org", "https://ipinfo.io/ip"}
+	publicIpService := os.Getenv("PUBLIC_IP_SERVICE")
+	if publicIpService != "" {
+		// prepend the user-specified service so it's checked first
+		iplist = append([]string{publicIpService}, iplist...)
+	} else if config.Config.Server.PublicIPService != "" {
+		publicIpService = config.Config.Server.PublicIPService
+
+		// prepend the user-specified service so it's checked first
+		iplist = append([]string{publicIpService}, iplist...)
+	}
+
 	for _, ipserver := range iplist {
-		resp, err := http.Get(ipserver)
+		client := &http.Client{
+			Timeout: time.Second * 10,
+		}
+		resp, err := client.Get(ipserver)
 		if err != nil {
 			continue
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
-			bodyBytes, err := ioutil.ReadAll(resp.Body)
+			bodyBytes, err := io.ReadAll(resp.Body)
 			if err != nil {
 				continue
 			}
@@ -422,21 +483,9 @@ func GetPublicIP() (string, error) {
 		}
 	}
 	if err == nil && endpoint == "" {
-		err = errors.New("Public Address Not Found.")
+		err = errors.New("public address not found")
 	}
 	return endpoint, err
-}
-
-// GetVerbose - get the verbosity of server
-func GetVerbose() int32 {
-	level, err := strconv.Atoi(os.Getenv("VERBOSITY"))
-	if err != nil || level < 0 {
-		level = 0
-	}
-	if level > 3 {
-		level = 3
-	}
-	return int32(level)
 }
 
 // GetPlatform - get the system type of server
@@ -450,6 +499,19 @@ func GetPlatform() string {
 	return platform
 }
 
+// GetIPForwardServiceList - get the list of services that the server should be forwarding
+func GetPortForwardServiceList() []string {
+	//services := "mq,dns,ssh"
+	services := ""
+	if os.Getenv("PORT_FORWARD_SERVICES") != "" {
+		services = os.Getenv("PORT_FORWARD_SERVICES")
+	} else if config.Config.Server.PortForwardServices != "" {
+		services = config.Config.Server.PortForwardServices
+	}
+	serviceSlice := strings.Split(services, ",")
+	return serviceSlice
+}
+
 // GetSQLConn - get the sql connection string
 func GetSQLConn() string {
 	sqlconn := "http://"
@@ -461,27 +523,37 @@ func GetSQLConn() string {
 	return sqlconn
 }
 
-// IsSplitDNS - checks if split dns is on
-func IsSplitDNS() bool {
-	issplit := false
-	if os.Getenv("IS_SPLIT_DNS") == "yes" {
-		issplit = true
-	} else if config.Config.Server.SplitDNS == "yes" {
-		issplit = true
+// IsHostNetwork - checks if running on host network
+func IsHostNetwork() bool {
+	ishost := false
+	if os.Getenv("HOST_NETWORK") == "on" {
+		ishost = true
+	} else if config.Config.Server.HostNetwork == "on" {
+		ishost = true
 	}
-	return issplit
+	return ishost
 }
 
 // GetNodeID - gets the node id
 func GetNodeID() string {
 	var id string
-	id = getMacAddr()
+	var err error
+	// id = getMacAddr()
 	if os.Getenv("NODE_ID") != "" {
 		id = os.Getenv("NODE_ID")
 	} else if config.Config.Server.NodeID != "" {
 		id = config.Config.Server.NodeID
+	} else {
+		id, err = os.Hostname()
+		if err != nil {
+			return ""
+		}
 	}
 	return id
+}
+
+func SetNodeID(id string) {
+	config.Config.Server.NodeID = id
 }
 
 // GetServerCheckinInterval - gets the server check-in time
@@ -497,36 +569,100 @@ func GetServerCheckinInterval() int64 {
 }
 
 // GetAuthProviderInfo = gets the oauth provider info
-func GetAuthProviderInfo() []string {
+func GetAuthProviderInfo() (pi []string) {
 	var authProvider = ""
+
+	defer func() {
+		if authProvider == "oidc" {
+			if os.Getenv("OIDC_ISSUER") != "" {
+				pi = append(pi, os.Getenv("OIDC_ISSUER"))
+			} else if config.Config.Server.OIDCIssuer != "" {
+				pi = append(pi, config.Config.Server.OIDCIssuer)
+			} else {
+				pi = []string{"", "", ""}
+			}
+		}
+	}()
+
 	if os.Getenv("AUTH_PROVIDER") != "" && os.Getenv("CLIENT_ID") != "" && os.Getenv("CLIENT_SECRET") != "" {
 		authProvider = strings.ToLower(os.Getenv("AUTH_PROVIDER"))
-		if authProvider == "google" || authProvider == "azure-ad" || authProvider == "github" {
+		if authProvider == "google" || authProvider == "azure-ad" || authProvider == "github" || authProvider == "oidc" {
 			return []string{authProvider, os.Getenv("CLIENT_ID"), os.Getenv("CLIENT_SECRET")}
 		} else {
 			authProvider = ""
 		}
 	} else if config.Config.Server.AuthProvider != "" && config.Config.Server.ClientID != "" && config.Config.Server.ClientSecret != "" {
 		authProvider = strings.ToLower(config.Config.Server.AuthProvider)
-		if authProvider == "google" || authProvider == "azure-ad" || authProvider == "github" {
+		if authProvider == "google" || authProvider == "azure-ad" || authProvider == "github" || authProvider == "oidc" {
 			return []string{authProvider, config.Config.Server.ClientID, config.Config.Server.ClientSecret}
 		}
 	}
 	return []string{"", "", ""}
 }
 
-// GetMacAddr - get's mac address
-func getMacAddr() string {
-	ifas, err := net.Interfaces()
-	if err != nil {
-		return ""
+// GetAzureTenant - retrieve the azure tenant ID from env variable or config file
+func GetAzureTenant() string {
+	var azureTenant = ""
+	if os.Getenv("AZURE_TENANT") != "" {
+		azureTenant = os.Getenv("AZURE_TENANT")
+	} else if config.Config.Server.AzureTenant != "" {
+		azureTenant = config.Config.Server.AzureTenant
 	}
-	var as []string
-	for _, ifa := range ifas {
-		a := ifa.HardwareAddr.String()
-		if a != "" {
-			as = append(as, a)
-		}
+	return azureTenant
+}
+
+// GetRce - sees if Rce is enabled, off by default
+func GetRce() bool {
+	return os.Getenv("RCE") == "on" || config.Config.Server.RCE == "on"
+}
+
+// GetMQServerPort - get mq port for server
+func GetMQServerPort() string {
+	port := "1883" //default
+	if os.Getenv("MQ_SERVER_PORT") != "" {
+		port = os.Getenv("MQ_SERVER_PORT")
+	} else if config.Config.Server.MQServerPort != "" {
+		port = config.Config.Server.MQServerPort
 	}
-	return as[0]
+	return port
+}
+
+// GetMqAdminPassword - fetches the MQ Admin password
+func GetMqAdminPassword() string {
+	password := ""
+	if os.Getenv("MQ_ADMIN_PASSWORD") != "" {
+		password = os.Getenv("MQ_ADMIN_PASSWORD")
+	} else if config.Config.Server.MQAdminPassword != "" {
+		password = config.Config.Server.MQAdminPassword
+	}
+	return password
+}
+
+// IsBasicAuthEnabled - checks if basic auth has been configured to be turned off
+func IsBasicAuthEnabled() bool {
+	var enabled = true //default
+	if os.Getenv("BASIC_AUTH") != "" {
+		enabled = os.Getenv("BASIC_AUTH") == "yes"
+	} else if config.Config.Server.BasicAuth != "" {
+		enabled = config.Config.Server.BasicAuth == "yes"
+	}
+	return enabled
+}
+
+// GetLicenseKey - retrieves pro license value from env or conf files
+func GetLicenseKey() string {
+	licenseKeyValue := os.Getenv("LICENSE_KEY")
+	if licenseKeyValue == "" {
+		licenseKeyValue = config.Config.Server.LicenseValue
+	}
+	return licenseKeyValue
+}
+
+// GetNetmakerAccountID - get's the associated, Netmaker, account ID to verify ownership
+func GetNetmakerAccountID() string {
+	netmakerAccountID := os.Getenv("NETMAKER_ACCOUNT_ID")
+	if netmakerAccountID == "" {
+		netmakerAccountID = config.Config.Server.LicenseValue
+	}
+	return netmakerAccountID
 }

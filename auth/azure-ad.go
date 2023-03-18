@@ -1,12 +1,13 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
-	"os"
 
+	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/logic"
 	"github.com/gravitl/netmaker/models"
 	"github.com/gravitl/netmaker/servercfg"
@@ -22,11 +23,6 @@ var azure_ad_functions = map[string]interface{}{
 	verify_user:     verifyAzureUser,
 }
 
-type azureOauthUser struct {
-	UserPrincipalName string `json:"userPrincipalName" bson:"userPrincipalName"`
-	AccessToken       string `json:"accesstoken" bson:"accesstoken"`
-}
-
 // == handle azure ad authentication here ==
 
 func initAzureAD(redirectURL string, clientID string, clientSecret string) {
@@ -35,12 +31,12 @@ func initAzureAD(redirectURL string, clientID string, clientSecret string) {
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		Scopes:       []string{"User.Read"},
-		Endpoint:     microsoft.AzureADEndpoint(os.Getenv("AZURE_TENANT")),
+		Endpoint:     microsoft.AzureADEndpoint(servercfg.GetAzureTenant()),
 	}
 }
 
 func handleAzureLogin(w http.ResponseWriter, r *http.Request) {
-	oauth_state_string = logic.RandomString(16)
+	var oauth_state_string = logic.RandomString(user_signin_length)
 	if auth_provider == nil && servercfg.GetFrontendURL() != "" {
 		http.Redirect(w, r, servercfg.GetFrontendURL()+"/login?oauth=callback-error", http.StatusTemporaryRedirect)
 		return
@@ -48,15 +44,22 @@ func handleAzureLogin(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%s", []byte("no frontend URL was provided and an OAuth login was attempted\nplease reconfigure server to use OAuth or use basic credentials"))
 		return
 	}
+
+	if err := logic.SetState(oauth_state_string); err != nil {
+		http.Redirect(w, r, servercfg.GetFrontendURL()+"/login?oauth=callback-error", http.StatusTemporaryRedirect)
+		return
+	}
+
 	var url = auth_provider.AuthCodeURL(oauth_state_string)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
 
 func handleAzureCallback(w http.ResponseWriter, r *http.Request) {
 
-	var content, err = getAzureUserInfo(r.FormValue("state"), r.FormValue("code"))
+	var rState, rCode = getStateAndCode(r)
+	var content, err = getAzureUserInfo(rState, rCode)
 	if err != nil {
-		logic.Log("error when getting user info from azure: "+err.Error(), 1)
+		logger.Log(1, "error when getting user info from azure:", err.Error())
 		http.Redirect(w, r, servercfg.GetFrontendURL()+"/login?oauth=callback-error", http.StatusTemporaryRedirect)
 		return
 	}
@@ -78,19 +81,20 @@ func handleAzureCallback(w http.ResponseWriter, r *http.Request) {
 
 	var jwt, jwtErr = logic.VerifyAuthRequest(authRequest)
 	if jwtErr != nil {
-		logic.Log("could not parse jwt for user "+authRequest.UserName, 1)
+		logger.Log(1, "could not parse jwt for user", authRequest.UserName)
 		return
 	}
 
-	logic.Log("completed azure OAuth sigin in for "+content.UserPrincipalName, 1)
+	logger.Log(1, "completed azure OAuth sigin in for", content.UserPrincipalName)
 	http.Redirect(w, r, servercfg.GetFrontendURL()+"/login?login="+jwt+"&user="+content.UserPrincipalName, http.StatusPermanentRedirect)
 }
 
-func getAzureUserInfo(state string, code string) (*azureOauthUser, error) {
-	if state != oauth_state_string {
+func getAzureUserInfo(state string, code string) (*OAuthUser, error) {
+	oauth_state_string, isValid := logic.IsStateValid(state)
+	if (!isValid || state != oauth_state_string) && !isStateCached(state) {
 		return nil, fmt.Errorf("invalid oauth state")
 	}
-	var token, err = auth_provider.Exchange(oauth2.NoContext, code)
+	var token, err = auth_provider.Exchange(context.Background(), code)
 	if err != nil {
 		return nil, fmt.Errorf("code exchange failed: %s", err.Error())
 	}
@@ -109,11 +113,11 @@ func getAzureUserInfo(state string, code string) (*azureOauthUser, error) {
 		return nil, fmt.Errorf("failed getting user info: %s", err.Error())
 	}
 	defer response.Body.Close()
-	contents, err := ioutil.ReadAll(response.Body)
+	contents, err := io.ReadAll(response.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed reading response body: %s", err.Error())
 	}
-	var userInfo = &azureOauthUser{}
+	var userInfo = &OAuthUser{}
 	if err = json.Unmarshal(contents, userInfo); err != nil {
 		return nil, fmt.Errorf("failed parsing email from response data: %s", err.Error())
 	}

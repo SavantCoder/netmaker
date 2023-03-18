@@ -3,7 +3,7 @@ FROM debian:buster as builder
 
 RUN apt update -y && apt install -y wget bash gcc musl-dev openssl golang git build-essential libmnl-dev iptables
 
-RUN wget -O go.tgz https://dl.google.com/go/go1.17.1.linux-amd64.tar.gz
+RUN wget -O go.tgz https://go.dev/dl/go1.19.linux-amd64.tar.gz
 
 RUN tar -C /usr/local -xzf go.tgz
 
@@ -54,4 +54,4 @@ RUN chmod 0755 netclient && chmod 0755 netclient.sh
 
 ENV WG_QUICK_USERSPACE_IMPLEMENTATION=wireguard-go
 
-ENTRYPOINT ["/bin/sh", "./netclient.sh"]
+ENTRYPOINT ["/bin/bash", "./netclient.sh"]

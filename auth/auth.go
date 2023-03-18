@@ -3,15 +3,19 @@ package auth
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
-	"github.com/gravitl/netmaker/logic"
-	"github.com/gravitl/netmaker/models"
-	"github.com/gravitl/netmaker/servercfg"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
+
+	"github.com/gravitl/netmaker/logger"
+	"github.com/gravitl/netmaker/logic"
+	"github.com/gravitl/netmaker/logic/pro/netcache"
+	"github.com/gravitl/netmaker/models"
+	"github.com/gravitl/netmaker/servercfg"
 )
 
 // == consts ==
@@ -23,11 +27,22 @@ const (
 	google_provider_name   = "google"
 	azure_ad_provider_name = "azure-ad"
 	github_provider_name   = "github"
+	oidc_provider_name     = "oidc"
 	verify_user            = "verifyuser"
 	auth_key               = "netmaker_auth"
+	user_signin_length     = 16
+	node_signin_length     = 64
 )
 
-var oauth_state_string = "netmaker-oauth-state" // should be set randomly each provider login
+// OAuthUser - generic OAuth strategy user
+type OAuthUser struct {
+	Name              string `json:"name" bson:"name"`
+	Email             string `json:"email" bson:"email"`
+	Login             string `json:"login" bson:"login"`
+	UserPrincipalName string `json:"userPrincipalName" bson:"userPrincipalName"`
+	AccessToken       string `json:"accesstoken" bson:"accesstoken"`
+}
+
 var auth_provider *oauth2.Config
 
 func getCurrentAuthFunctions() map[string]interface{} {
@@ -40,6 +55,8 @@ func getCurrentAuthFunctions() map[string]interface{} {
 		return azure_ad_functions
 	case github_provider_name:
 		return github_functions
+	case oidc_provider_name:
+		return oidc_functions
 	default:
 		return nil
 	}
@@ -53,7 +70,7 @@ func InitializeAuthProvider() string {
 	}
 	var _, err = fetchPassValue(logic.RandomString(64))
 	if err != nil {
-		logic.Log(err.Error(), 0)
+		logger.Log(0, err.Error())
 		return ""
 	}
 	var currentFrontendURL = servercfg.GetFrontendURL()
@@ -64,10 +81,15 @@ func InitializeAuthProvider() string {
 	var serverConn = servercfg.GetAPIHost()
 	if strings.Contains(serverConn, "localhost") || strings.Contains(serverConn, "127.0.0.1") {
 		serverConn = "http://" + serverConn
-		logic.Log("localhost OAuth detected, proceeding with insecure http redirect: "+serverConn+")", 1)
+		logger.Log(1, "localhost OAuth detected, proceeding with insecure http redirect: (", serverConn, ")")
 	} else {
 		serverConn = "https://" + serverConn
-		logic.Log("external OAuth detected, proceeding with https redirect: ("+serverConn+")", 1)
+		logger.Log(1, "external OAuth detected, proceeding with https redirect: ("+serverConn+")")
+	}
+
+	if authInfo[0] == "oidc" {
+		functions[init_provider].(func(string, string, string, string))(serverConn+"/api/oauth/callback", authInfo[1], authInfo[2], authInfo[3])
+		return authInfo[0]
 	}
 
 	functions[init_provider].(func(string, string, string))(serverConn+"/api/oauth/callback", authInfo[1], authInfo[2])
@@ -75,20 +97,35 @@ func InitializeAuthProvider() string {
 }
 
 // HandleAuthCallback - handles oauth callback
+// Note: not included in API reference as part of the OAuth process itself.
 func HandleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if auth_provider == nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprintln(w, oauthNotConfigured)
+		_, _ = fmt.Fprintln(w, oauthNotConfigured)
 		return
 	}
 	var functions = getCurrentAuthFunctions()
 	if functions == nil {
 		return
 	}
-	functions[handle_callback].(func(http.ResponseWriter, *http.Request))(w, r)
+	state, _ := getStateAndCode(r)
+	_, err := netcache.Get(state) // if in netcache proceeed with node registration login
+	if err == nil || len(state) == node_signin_length || errors.Is(err, netcache.ErrExpired) {
+		logger.Log(0, "proceeding with node SSO callback")
+		HandleNodeSSOCallback(w, r)
+	} else { // handle normal login
+		functions[handle_callback].(func(http.ResponseWriter, *http.Request))(w, r)
+	}
 }
 
-// HandleAuthLogin - handles oauth login
+// swagger:route GET /api/oauth/login nodes HandleAuthLogin
+//
+// Handles OAuth login.
+//
+//			Schemes: https
+//
+//			Security:
+//	  		oauth
 func HandleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if auth_provider == nil {
 		var referer = r.Header.Get("referer")
@@ -97,7 +134,7 @@ func HandleAuthLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprintln(w, oauthNotConfigured)
+		_, _ = fmt.Fprintln(w, oauthNotConfigured)
 		return
 	}
 	var functions = getCurrentAuthFunctions()
@@ -122,7 +159,7 @@ func IsOauthUser(user *models.User) error {
 func addUser(email string) error {
 	var hasAdmin, err = logic.HasAdmin()
 	if err != nil {
-		logic.Log("error checking for existence of admin user during OAuth login for "+email+", user not added", 1)
+		logger.Log(1, "error checking for existence of admin user during OAuth login for", email, "; user not added")
 		return err
 	} // generate random password to adapt to current model
 	var newPass, fetchErr = fetchPassValue("")
@@ -134,18 +171,18 @@ func addUser(email string) error {
 		Password: newPass,
 	}
 	if !hasAdmin { // must be first attempt, create an admin
-		if newUser, err = logic.CreateAdmin(newUser); err != nil {
-			logic.Log("error creating admin from user, "+email+", user not added", 1)
+		if err = logic.CreateAdmin(&newUser); err != nil {
+			logger.Log(1, "error creating admin from user,", email, "; user not added")
 		} else {
-			logic.Log("admin created from user, "+email+", was first user added", 0)
+			logger.Log(1, "admin created from user,", email, "; was first user added")
 		}
 	} else { // otherwise add to db as admin..?
 		// TODO: add ability to add users with preemptive permissions
 		newUser.IsAdmin = false
-		if newUser, err = logic.CreateUser(newUser); err != nil {
-			logic.Log("error creating user, "+email+", user not added", 1)
+		if err = logic.CreateUser(&newUser); err != nil {
+			logger.Log(1, "error creating user,", email, "; user not added")
 		} else {
-			logic.Log("user created from, "+email+"", 0)
+			logger.Log(0, "user created from ", email)
 		}
 	}
 	return nil
@@ -176,8 +213,40 @@ func fetchPassValue(newValue string) (string, error) {
 
 	var b64CurrentValue, b64Err = base64.StdEncoding.DecodeString(newValueHolder.Value)
 	if b64Err != nil {
-		logic.Log("could not decode pass", 0)
+		logger.Log(0, "could not decode pass")
 		return "", nil
 	}
 	return string(b64CurrentValue), nil
+}
+
+func getStateAndCode(r *http.Request) (string, string) {
+	var state, code string
+	if r.FormValue("state") != "" && r.FormValue("code") != "" {
+		state = r.FormValue("state")
+		code = r.FormValue("code")
+	} else if r.URL.Query().Get("state") != "" && r.URL.Query().Get("code") != "" {
+		state = r.URL.Query().Get("state")
+		code = r.URL.Query().Get("code")
+	}
+
+	return state, code
+}
+
+func (user *OAuthUser) getUserName() string {
+	var userName string
+	if user.Email != "" {
+		userName = user.Email
+	} else if user.Login != "" {
+		userName = user.Login
+	} else if user.UserPrincipalName != "" {
+		userName = user.UserPrincipalName
+	} else if user.Name != "" {
+		userName = user.Name
+	}
+	return userName
+}
+
+func isStateCached(state string) bool {
+	_, err := netcache.Get(state)
+	return err == nil || strings.Contains(err.Error(), "expired")
 }

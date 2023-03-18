@@ -2,18 +2,32 @@ package ncutils
 
 import (
 	"context"
-	"fmt"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-	"log"
 	"os/exec"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/gravitl/netmaker/logger"
 )
 
+// RunCmdFormatted - run a command formatted for freebsd
 func RunCmdFormatted(command string, printerr bool) (string, error) {
-	return "", nil
+
+	args := strings.Fields(command)
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Start()
+	cmd.Wait()
+	out, err := cmd.CombinedOutput()
+	if err != nil && printerr {
+		logger.Log(0, "error running command: ", command)
+		logger.Log(0, strings.TrimSuffix(string(out), "\n"))
+	}
+	return string(out), err
+}
+
+// GetEmbedded - if files required for freebsd, put here
+func GetEmbedded() error {
+	return nil
 }
 
 // Runs Commands for FreeBSD
@@ -29,38 +43,8 @@ func RunCmd(command string, printerr bool) (string, error) {
 	}()
 	out, err := cmd.CombinedOutput()
 	if err != nil && printerr {
-		log.Println("error running command:", command)
-		log.Println(strings.TrimSuffix(string(out), "\n"))
+		logger.Log(0, "error running command:", command)
+		logger.Log(0, strings.TrimSuffix(string(out), "\n"))
 	}
 	return string(out), err
-}
-
-// CreateUserSpaceConf - creates a user space WireGuard conf
-func CreateUserSpaceConf(address string, privatekey string, listenPort string, mtu int32, perskeepalive int32, peers []wgtypes.PeerConfig) (string, error) {
-	peersString, err := parsePeers(perskeepalive, peers)
-	var listenPortString string
-	if mtu <= 0 {
-		mtu = 1280
-	}
-	if listenPort != "" {
-		listenPortString += "ListenPort = " + listenPort
-	}
-	if err != nil {
-		return "", err
-	}
-	config := fmt.Sprintf(`[Interface]
-Address = %s
-PrivateKey = %s
-MTU = %s
-%s
-
-%s
-
-`,
-		address+"/32",
-		privatekey,
-		strconv.Itoa(int(mtu)),
-		listenPortString,
-		peersString)
-	return config, nil
 }

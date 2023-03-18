@@ -2,12 +2,10 @@ package ncutils
 
 import (
 	"fmt"
-	"log"
 	"os/exec"
-	"strconv"
 	"strings"
 
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+	"github.com/gravitl/netmaker/logger"
 )
 
 // RunCmd - runs a local command
@@ -17,42 +15,18 @@ func RunCmd(command string, printerr bool) (string, error) {
 	cmd.Wait()
 	out, err := cmd.CombinedOutput()
 	if err != nil && printerr {
-		log.Println("error running command:", command)
-		log.Println(strings.TrimSuffix(string(out), "\n"))
+		logger.Log(0, fmt.Sprintf("error running command: %s", command))
+		logger.Log(0, strings.TrimSuffix(string(out), "\n"))
 	}
 	return string(out), err
 }
 
+// RunCmdFormatted - does nothing for linux
 func RunCmdFormatted(command string, printerr bool) (string, error) {
 	return "", nil
 }
 
-// CreateUserSpaceConf - creates a user space WireGuard conf
-func CreateUserSpaceConf(address string, privatekey string, listenPort string, mtu int32, perskeepalive int32, peers []wgtypes.PeerConfig) (string, error) {
-	peersString, err := parsePeers(perskeepalive, peers)
-	var listenPortString string
-	if mtu <= 0 {
-		mtu = 1280
-	}
-	if listenPort != "" {
-		listenPortString += "ListenPort = " + listenPort
-	}
-	if err != nil {
-		return "", err
-	}
-	config := fmt.Sprintf(`[Interface]
-Address = %s
-PrivateKey = %s
-MTU = %s
-%s
-
-%s
-
-`,
-		address+"/32",
-		privatekey,
-		strconv.Itoa(int(mtu)),
-		listenPortString,
-		peersString)
-	return config, nil
+// GetEmbedded - if files required for linux, put here
+func GetEmbedded() error {
+	return nil
 }

@@ -1,11 +1,13 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 
+	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/logic"
 	"github.com/gravitl/netmaker/models"
 	"github.com/gravitl/netmaker/servercfg"
@@ -21,11 +23,6 @@ var github_functions = map[string]interface{}{
 	verify_user:     verifyGithubUser,
 }
 
-type githubOauthUser struct {
-	Login       string `json:"login" bson:"login"`
-	AccessToken string `json:"accesstoken" bson:"accesstoken"`
-}
-
 // == handle github authentication here ==
 
 func initGithub(redirectURL string, clientID string, clientSecret string) {
@@ -39,7 +36,7 @@ func initGithub(redirectURL string, clientID string, clientSecret string) {
 }
 
 func handleGithubLogin(w http.ResponseWriter, r *http.Request) {
-	oauth_state_string = logic.RandomString(16)
+	var oauth_state_string = logic.RandomString(user_signin_length)
 	if auth_provider == nil && servercfg.GetFrontendURL() != "" {
 		http.Redirect(w, r, servercfg.GetFrontendURL()+"/login?oauth=callback-error", http.StatusTemporaryRedirect)
 		return
@@ -47,15 +44,22 @@ func handleGithubLogin(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%s", []byte("no frontend URL was provided and an OAuth login was attempted\nplease reconfigure server to use OAuth or use basic credentials"))
 		return
 	}
+
+	if err := logic.SetState(oauth_state_string); err != nil {
+		http.Redirect(w, r, servercfg.GetFrontendURL()+"/login?oauth=callback-error", http.StatusTemporaryRedirect)
+		return
+	}
+
 	var url = auth_provider.AuthCodeURL(oauth_state_string)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
 
 func handleGithubCallback(w http.ResponseWriter, r *http.Request) {
 
-	var content, err = getGithubUserInfo(r.URL.Query().Get("state"), r.URL.Query().Get("code"))
+	var rState, rCode = getStateAndCode(r)
+	var content, err = getGithubUserInfo(rState, rCode)
 	if err != nil {
-		logic.Log("error when getting user info from github: "+err.Error(), 1)
+		logger.Log(1, "error when getting user info from github:", err.Error())
 		http.Redirect(w, r, servercfg.GetFrontendURL()+"/login?oauth=callback-error", http.StatusTemporaryRedirect)
 		return
 	}
@@ -77,19 +81,20 @@ func handleGithubCallback(w http.ResponseWriter, r *http.Request) {
 
 	var jwt, jwtErr = logic.VerifyAuthRequest(authRequest)
 	if jwtErr != nil {
-		logic.Log("could not parse jwt for user "+authRequest.UserName, 1)
+		logger.Log(1, "could not parse jwt for user", authRequest.UserName)
 		return
 	}
 
-	logic.Log("completed github OAuth sigin in for "+content.Login, 1)
+	logger.Log(1, "completed github OAuth sigin in for", content.Login)
 	http.Redirect(w, r, servercfg.GetFrontendURL()+"/login?login="+jwt+"&user="+content.Login, http.StatusPermanentRedirect)
 }
 
-func getGithubUserInfo(state string, code string) (*githubOauthUser, error) {
-	if state != oauth_state_string {
-		return nil, fmt.Errorf("invalid OAuth state")
+func getGithubUserInfo(state string, code string) (*OAuthUser, error) {
+	oauth_state_string, isValid := logic.IsStateValid(state)
+	if (!isValid || state != oauth_state_string) && !isStateCached(state) {
+		return nil, fmt.Errorf("invalid oauth state")
 	}
-	var token, err = auth_provider.Exchange(oauth2.NoContext, code)
+	var token, err = auth_provider.Exchange(context.Background(), code)
 	if err != nil {
 		return nil, fmt.Errorf("code exchange failed: %s", err.Error())
 	}
@@ -112,11 +117,11 @@ func getGithubUserInfo(state string, code string) (*githubOauthUser, error) {
 		return nil, fmt.Errorf("failed getting user info: %s", err.Error())
 	}
 	defer response.Body.Close()
-	contents, err := ioutil.ReadAll(response.Body)
+	contents, err := io.ReadAll(response.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed reading response body: %s", err.Error())
 	}
-	var userInfo = &githubOauthUser{}
+	var userInfo = &OAuthUser{}
 	if err = json.Unmarshal(contents, userInfo); err != nil {
 		return nil, fmt.Errorf("failed parsing email from response data: %s", err.Error())
 	}

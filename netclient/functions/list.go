@@ -3,38 +3,50 @@ package functions
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 
-	nodepb "github.com/gravitl/netmaker/grpc"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
+	"github.com/gravitl/netmaker/logger"
 	"github.com/gravitl/netmaker/models"
-	"github.com/gravitl/netmaker/netclient/auth"
 	"github.com/gravitl/netmaker/netclient/config"
 	"github.com/gravitl/netmaker/netclient/ncutils"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
 )
 
+// Peer - the peer struct for list
 type Peer struct {
-	Name           string `json:"name"`
-	Interface      string `json:"interface,omitempty"`
-	PrivateIPv4    string `json:"private_ipv4,omitempty"`
-	PrivateIPv6    string `json:"private_ipv6,omitempty"`
-	PublicEndpoint string `json:"public_endoint,omitempty"`
+	Name           string    `json:"name,omitempty"`
+	Interface      string    `json:"interface,omitempty"`
+	PrivateIPv4    string    `json:"private_ipv4,omitempty"`
+	PrivateIPv6    string    `json:"private_ipv6,omitempty"`
+	PublicKey      string    `json:"public_key,omitempty"`
+	PublicEndpoint string    `json:"public_endpoint,omitempty"`
+	Addresses      []address `json:"addresses,omitempty"`
 }
 
+// Network - the local node network representation for list command
 type Network struct {
 	Name        string `json:"name"`
+	ID          string `json:"node_id"`
 	CurrentNode Peer   `json:"current_node"`
 	Peers       []Peer `json:"peers"`
 }
 
-func List(network string) error {
+type address struct {
+	CIDR string `json:"cidr,omitempty"`
+	IP   string `json:"ip,omitempty"`
+}
+
+// List - lists the current peers for the local node with name and node ID
+func List(network string) ([]Network, error) {
 	nets := []Network{}
 	var err error
 	var networks []string
 	if network == "all" {
 		networks, err = ncutils.GetSystemNetworks()
 		if err != nil {
-			return err
+			return nil, err
 		}
 	} else {
 		networks = append(networks, network)
@@ -43,8 +55,12 @@ func List(network string) error {
 	for _, network := range networks {
 		net, err := getNetwork(network)
 		if err != nil {
-			ncutils.PrintLog(network+": Could not retrieve network configuration.", 1)
-			return err
+			logger.Log(1, network+": Could not retrieve network configuration.")
+			return nil, err
+		}
+		peers, err := getPeers(network)
+		if err == nil && len(peers) > 0 {
+			net.Peers = peers
 		}
 		nets = append(nets, net)
 	}
@@ -54,7 +70,7 @@ func List(network string) error {
 	}{nets})
 	fmt.Println(string(jsoncfg))
 
-	return nil
+	return nets, nil
 }
 
 func getNetwork(network string) (Network, error) {
@@ -62,12 +78,14 @@ func getNetwork(network string) (Network, error) {
 	if err != nil {
 		return Network{}, fmt.Errorf("reading configuration for network %v: %w", network, err)
 	}
-	peers, err := getPeers(network)
-	if err != nil {
+	// peers, err := getPeers(network)
+	peers := []Peer{}
+	/*	if err != nil {
 		return Network{}, fmt.Errorf("listing peers for network %v: %w", network, err)
-	}
+	}*/
 	return Network{
 		Name:  network,
+		ID:    cfg.Node.ID,
 		Peers: peers,
 		CurrentNode: Peer{
 			Name:           cfg.Node.Name,
@@ -84,44 +102,46 @@ func getPeers(network string) ([]Peer, error) {
 	if err != nil {
 		return []Peer{}, err
 	}
-	nodecfg := cfg.Node
-	var nodes []models.Node
-
-	var wcclient nodepb.NodeServiceClient
-	conn, err := grpc.Dial(cfg.Server.GRPCAddress,
-		ncutils.GRPCRequestOpts(cfg.Server.GRPCSSL))
-
+	token, err := Authenticate(cfg)
 	if err != nil {
-		return []Peer{}, fmt.Errorf("connecting to %v: %w", cfg.Server.GRPCAddress, err)
+		return nil, err
 	}
-	defer conn.Close()
-	// Instantiate the BlogServiceClient with our client connection to the server
-	wcclient = nodepb.NewNodeServiceClient(conn)
-
-	req := &nodepb.Object{
-		Data: nodecfg.MacAddress + "###" + nodecfg.Network,
-		Type: nodepb.STRING_TYPE,
-	}
-
-	ctx, err := auth.SetJWT(wcclient, network)
+	url := "https://" + cfg.Server.API + "/api/nodes/" + cfg.Network + "/" + cfg.Node.ID
+	response, err := API("", http.MethodGet, url, token)
 	if err != nil {
-		return []Peer{}, fmt.Errorf("authenticating: %w", err)
+		return nil, err
 	}
-	var header metadata.MD
-
-	response, err := wcclient.GetPeers(ctx, req, grpc.Header(&header))
-	if err != nil {
-		return []Peer{}, fmt.Errorf("retrieving peers: %w", err)
+	if response.StatusCode != http.StatusOK {
+		bytes, err := io.ReadAll(response.Body)
+		if err != nil {
+			fmt.Println(err)
+		}
+		return nil, (fmt.Errorf("%s %w", string(bytes), err))
 	}
-	if err := json.Unmarshal([]byte(response.GetData()), &nodes); err != nil {
-		return []Peer{}, fmt.Errorf("unmarshaling data for peers: %w", err)
+	defer response.Body.Close()
+	var nodeGET models.NodeGet
+	if err := json.NewDecoder(response.Body).Decode(&nodeGET); err != nil {
+		return nil, fmt.Errorf("error decoding node %w", err)
+	}
+	if nodeGET.Peers == nil {
+		nodeGET.Peers = []wgtypes.PeerConfig{}
 	}
 
 	peers := []Peer{}
-	for _, node := range nodes {
-		if node.Name != cfg.Node.Name {
-			peers = append(peers, Peer{Name: fmt.Sprintf("%v.%v", node.Name, network), PrivateIPv4: node.Address, PrivateIPv6: node.Address6})
+	for _, peer := range nodeGET.Peers {
+		var addresses = []address{}
+		for j := range peer.AllowedIPs {
+			newAddress := address{
+				CIDR: peer.AllowedIPs[j].String(),
+				IP:   peer.AllowedIPs[j].IP.String(),
+			}
+			addresses = append(addresses, newAddress)
 		}
+		peers = append(peers, Peer{
+			PublicKey:      peer.PublicKey.String(),
+			PublicEndpoint: peer.Endpoint.String(),
+			Addresses:      addresses,
+		})
 	}
 
 	return peers, nil
